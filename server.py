@@ -1962,11 +1962,19 @@ def _pack_compact(content: str, cap: int, footer: str = "") -> dict:
 
 
 def _session_start_hook() -> None:
-    """Output SessionStart hook JSON by delegating to _refresh_load."""
+    """Output SessionStart hook JSON by delegating to _refresh_load.
+
+    Only auto-restores if a prior session left REFRESH_PENDING behind.
+    Without that marker, emits an empty hook payload — no banner, no
+    injected context, no menu. The menu fallback in _refresh_load is
+    intended for the interactive load() MCP tool, not the hook.
+    """
+    if not REFRESH_PENDING.exists():
+        print(json.dumps({}))
+        return
+
     # Peek at pending before _refresh_load clears it — needed for chain handoff
-    loaded_sid = ""
-    if REFRESH_PENDING.exists():
-        loaded_sid = REFRESH_PENDING.read_text().strip()
+    loaded_sid = REFRESH_PENDING.read_text().strip()
 
     content = _refresh_load()
 

@@ -128,6 +128,22 @@ def test_session_start_hook_no_pending(tmp_path, monkeypatch, capsys):
     assert data == {}
 
 
+def test_session_start_hook_no_pending_with_chain_files_on_disk(tmp_path, monkeypatch, capsys):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    (tmp_path / "chain-aaaa1111-2222-3333-4444-555566667777.md").write_text(
+        "## Session aaaa1111-2222-3333-4444-555566667777 | 2026-05-17 16:00 IST | claude | x\n\n"
+        "### Summary\n- leftover session\n"
+    )
+    (tmp_path / "chain-bbbb1111-2222-3333-4444-555566667777.md").write_text(
+        "## Session bbbb1111-2222-3333-4444-555566667777 | 2026-05-16 10:00 IST | claude | y\n\n"
+        "### Summary\n- another leftover\n"
+    )
+    server._session_start_hook()
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert data == {}
+
+
 def test_session_start_hook_with_pending(tmp_path, monkeypatch, capsys):
     _isolate_clexo_dir(tmp_path, monkeypatch)
     sid = "test-uuid-hook"
