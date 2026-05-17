@@ -1803,13 +1803,15 @@ def _run_server():
         """Return clexo usage stats."""
         try:
             rows = {r[0]: r[1] for r in db.execute("SELECT key, value FROM stats").fetchall()}
+            sessions = db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
             return "\n".join([
+                f"Sessions indexed:   {sessions:>6,}",
+                f"Messages indexed:   {rows.get('messages_indexed', 0):>6,}",
                 f"Saves:              {rows.get('refresh_saves',    0):>6,}",
                 f"Loads:              {rows.get('refresh_loads',    0):>6,}",
                 f"Tokens saved:       {rows.get('tokens_saved',     0):>6,}",
                 f"Pick uses:          {rows.get('pick_uses',        0):>6,}",
                 f"Search calls:       {rows.get('search_calls',     0):>6,}",
-                f"Messages indexed:   {rows.get('messages_indexed', 0):>6,}",
             ])
         except Exception as e:
             return f"Stats unavailable: {e}"
@@ -2076,14 +2078,17 @@ def _session_start_hook() -> None:
 
 def _print_stats() -> None:
     try:
-        rows = {r[0]: r[1] for r in get_db().execute("SELECT key, value FROM stats").fetchall()}
+        db = get_db()
+        rows = {r[0]: r[1] for r in db.execute("SELECT key, value FROM stats").fetchall()}
+        sessions = db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
         print("\n".join([
+            f"Sessions indexed:   {sessions:>6,}",
+            f"Messages indexed:   {rows.get('messages_indexed', 0):>6,}",
             f"Saves:              {rows.get('refresh_saves',    0):>6,}",
             f"Loads:              {rows.get('refresh_loads',    0):>6,}",
             f"Tokens saved:       {rows.get('tokens_saved',     0):>6,}",
             f"Pick uses:          {rows.get('pick_uses',        0):>6,}",
             f"Search calls:       {rows.get('search_calls',     0):>6,}",
-            f"Messages indexed:   {rows.get('messages_indexed', 0):>6,}",
         ]))
     except Exception as e:
         print(f"Stats unavailable: {e}", file=sys.stderr)
