@@ -1970,6 +1970,9 @@ def _session_start_hook() -> None:
     intended for the interactive load() MCP tool, not the hook.
     """
     if not REFRESH_PENDING.exists():
+        # No chain handoff in progress — drop any stale marker from a
+        # prior restored-but-never-saved session.
+        _CHAIN_LOADED.unlink(missing_ok=True)
         print(json.dumps({}))
         return
 

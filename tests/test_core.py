@@ -144,6 +144,14 @@ def test_session_start_hook_no_pending_with_chain_files_on_disk(tmp_path, monkey
     assert data == {}
 
 
+def test_session_start_hook_no_pending_clears_stale_chain_loaded(tmp_path, monkeypatch, capsys):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    (tmp_path / "chain-loaded").write_text("stale-uuid-from-prior-session")
+    server._session_start_hook()
+    assert not (tmp_path / "chain-loaded").exists()
+    assert json.loads(capsys.readouterr().out) == {}
+
+
 def test_session_start_hook_with_pending(tmp_path, monkeypatch, capsys):
     _isolate_clexo_dir(tmp_path, monkeypatch)
     sid = "test-uuid-hook"
