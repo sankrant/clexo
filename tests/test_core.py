@@ -281,6 +281,134 @@ def test_create_tag_rejects_bad_uuid(isolated_db):
     assert "doesn't look like a UUID" in out
 
 
+# ── Hook installer ────────────────────────────────────────────────────────────
+
+def test_install_hooks_creates_settings(tmp_path):
+    settings = tmp_path / "settings.json"
+    result = server._install_hooks(settings_path=settings)
+    assert "added" in result
+    assert settings.exists()
+    data = json.loads(settings.read_text())
+    start = data["hooks"]["SessionStart"]
+    end   = data["hooks"]["SessionEnd"]
+    assert any(h["matcher"] == "startup|clear" for h in start)
+    assert any(h["matcher"] == ""               for h in end)
+    assert any("--session-start" in h["command"]
+               for entry in start for h in entry["hooks"])
+    assert any("--sync" in h["command"]
+               for entry in end   for h in entry["hooks"])
+
+
+def test_install_hooks_is_idempotent(tmp_path):
+    settings = tmp_path / "settings.json"
+    server._install_hooks(settings_path=settings)
+    snapshot = settings.read_text()
+    backups_before = set(tmp_path.glob("settings.json.bak.*"))
+    result2 = server._install_hooks(settings_path=settings)
+    assert "already up to date" in result2
+    assert "already installed" in result2
+    # Body should be byte-identical (no duplicate entries appended)
+    assert settings.read_text() == snapshot
+    # No new backup should be created on a no-op call
+    assert set(tmp_path.glob("settings.json.bak.*")) == backups_before
+
+
+def test_install_hooks_preserves_existing_settings(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "model": "sonnet",
+        "permissions": {"allow": ["Bash(ls:*)"]},
+        "hooks": {
+            "PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "echo before-bash"}
+            ]}]
+        }
+    }))
+    server._install_hooks(settings_path=settings)
+    data = json.loads(settings.read_text())
+    assert data["model"] == "sonnet"
+    assert data["permissions"]["allow"] == ["Bash(ls:*)"]
+    assert data["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "echo before-bash"
+    assert "SessionStart" in data["hooks"]
+
+
+def test_install_hooks_appends_to_matching_matcher(tmp_path):
+    """If a SessionStart entry already exists with matcher='startup|clear' and
+    a different command, append ours to that entry rather than create a duplicate."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{"matcher": "startup|clear", "hooks": [
+                {"type": "command", "command": "other-tool --start"}
+            ]}]
+        }
+    }))
+    server._install_hooks(settings_path=settings)
+    data = json.loads(settings.read_text())
+    start = data["hooks"]["SessionStart"]
+    assert len(start) == 1, "should reuse the existing matcher entry"
+    commands = [h["command"] for h in start[0]["hooks"]]
+    assert any("other-tool" in c for c in commands)
+    assert any("--session-start" in c for c in commands)
+
+
+def test_install_hooks_creates_separate_entry_for_different_matcher(tmp_path):
+    """If a SessionStart entry exists with matcher='clear' (someone else's),
+    we add ours as a NEW entry with matcher='startup|clear' — don't share."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{"matcher": "clear", "hooks": [
+                {"type": "command", "command": "other-tool --start"}
+            ]}]
+        }
+    }))
+    server._install_hooks(settings_path=settings)
+    data = json.loads(settings.read_text())
+    start = data["hooks"]["SessionStart"]
+    assert len(start) == 2, "different matcher → separate entry"
+    matchers = sorted(e["matcher"] for e in start)
+    assert matchers == ["clear", "startup|clear"]
+
+
+def test_install_hooks_migrates_old_matcher(tmp_path):
+    """Existing installs may have matcher='clear' from an older version.
+    Re-running install should rewrite that matcher to 'startup|clear' in place."""
+    settings = tmp_path / "settings.json"
+    # Simulate an old install: matcher='clear' with our marker command.
+    settings.write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{"matcher": "clear", "hooks": [
+                {"type": "command", "command": "python3 /old/path/clexo/server.py --session-start"}
+            ]}]
+        }
+    }))
+    result = server._install_hooks(settings_path=settings)
+    assert "matcher updated" in result
+    data = json.loads(settings.read_text())
+    start = data["hooks"]["SessionStart"]
+    assert len(start) == 1, "should update in place, not duplicate"
+    assert start[0]["matcher"] == "startup|clear"
+
+
+def test_install_hooks_backs_up_existing(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text('{"foo": "bar"}')
+    result = server._install_hooks(settings_path=settings)
+    assert "Backed up" in result
+    backups = list(tmp_path.glob("settings.json.bak.*"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == '{"foo": "bar"}'
+
+
+def test_install_hooks_rejects_malformed_json(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text("{ not json")
+    result = server._install_hooks(settings_path=settings)
+    assert result.startswith("Error:")
+    assert "not valid JSON" in result
+
+
 # ── Keyword extraction & chain summary ────────────────────────────────────────
 
 def test_session_keywords_basic(isolated_db):

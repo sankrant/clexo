@@ -2076,6 +2076,101 @@ def _session_start_hook() -> None:
     }))
 
 
+def _install_hooks(settings_path: Path | None = None) -> str:
+    """Idempotently add the SessionStart + SessionEnd hooks to Claude Code's
+    settings.json. Backs up + writes ONLY if the JSON actually changes. Skips
+    if our commands are already present (matched on the --session-start /
+    --sync flags plus a path containing 'clexo')."""
+    settings_dir = (settings_path.parent if settings_path
+                    else Path.home() / ".claude")
+    settings_path = settings_path or (settings_dir / "settings.json")
+    server_abs = str(Path(__file__).resolve())
+    start_cmd  = f"python3 {server_abs} --session-start"
+    end_cmd    = f"bash -c 'python3 {server_abs} --sync >> /tmp/clexo-sync.log 2>&1 &'"
+
+    raw = ""
+    if settings_path.exists():
+        try:
+            raw = settings_path.read_text()
+            settings = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError as e:
+            return f"Error: {settings_path} is not valid JSON ({e}). Aborted."
+        if not isinstance(settings, dict):
+            return f"Error: {settings_path} is not a JSON object. Aborted."
+    else:
+        settings = {}
+
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        return "Error: settings.json 'hooks' is not an object. Aborted."
+
+    change_lines: list[str] = []
+
+    def _has_clexo_cmd(entries: list, marker: str) -> bool:
+        for he in entries if isinstance(entries, list) else []:
+            for h in he.get("hooks", []) if isinstance(he, dict) else []:
+                cmd = h.get("command", "") if isinstance(h, dict) else ""
+                if marker in cmd and ("clexo" in cmd.lower() or server_abs in cmd):
+                    return True
+        return False
+
+    def _add(event: str, matcher: str, marker: str, command: str, label: str):
+        entries = hooks.setdefault(event, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"hooks.{event} is not a list")
+        # If our command is already present, migrate the matcher in place if needed.
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            for h in e.get("hooks", []):
+                if not isinstance(h, dict):
+                    continue
+                cmd = h.get("command", "")
+                if marker in cmd and ("clexo" in cmd.lower() or server_abs in cmd):
+                    if e.get("matcher") != matcher:
+                        old = e.get("matcher", "")
+                        e["matcher"] = matcher
+                        change_lines.append(
+                            f"  ✎ {label}: matcher updated {old!r} → {matcher!r}")
+                    else:
+                        change_lines.append(f"  ↻ {label}: already installed")
+                    return
+        # Not present — append to existing entry with the same matcher, or create one.
+        target = next((e for e in entries
+                       if isinstance(e, dict) and e.get("matcher") == matcher), None)
+        if target is None:
+            target = {"matcher": matcher, "hooks": []}
+            entries.append(target)
+        target.setdefault("hooks", []).append({"type": "command", "command": command})
+        change_lines.append(f"  + {label}: added")
+
+    try:
+        # SessionStart matcher fires on startup AND clear (not resume/compact).
+        # This is what enables `clexo load <sid>` then `claude` to restore.
+        _add("SessionStart", "startup|clear", "--session-start", start_cmd, "SessionStart hook")
+        _add("SessionEnd",   "",              "--sync",          end_cmd,   "SessionEnd hook")
+    except ValueError as e:
+        return f"Error: {e}. Aborted (no changes written)."
+
+    new_content = json.dumps(settings, indent=2) + "\n"
+    if settings_path.exists() and new_content == raw:
+        return f"{settings_path}: already up to date — no changes.\n" + "\n".join(change_lines)
+
+    out_lines: list[str] = []
+    if settings_path.exists():
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = settings_path.with_suffix(f".json.bak.{ts}")
+        backup.write_text(raw)
+        out_lines.append(f"Backed up: {backup}")
+    else:
+        settings_dir.mkdir(parents=True, exist_ok=True)
+
+    settings_path.write_text(new_content)
+    out_lines.extend(change_lines)
+    out_lines.append(f"Wrote:     {settings_path}")
+    return "\n".join(out_lines)
+
+
 def _print_stats() -> None:
     try:
         db = get_db()
@@ -2112,8 +2207,19 @@ if __name__ == "__main__":
         print(_search(query))
     elif "--save" in sys.argv:
         idx = sys.argv.index("--save")
-        sid = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
-        print(refresh_save(sid))
+        arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
+        # If a non-empty arg was given but doesn't look like a UUID or known tag,
+        # error before falling through to "No session JSONL found".
+        if arg:
+            resolved = _resolve_session_or_tag(arg)
+            if not _TAG_UUID_RE.match(resolved.lower()):
+                print(f"'{arg}' is not a complete UUID (need 36 chars, "
+                      f"8-4-4-4-12) and not a known tag. "
+                      f"Run `clexo tags` to list, or check that the sid wasn't truncated.",
+                      file=sys.stderr)
+                sys.exit(1)
+            arg = resolved
+        print(refresh_save(arg))
     # ── Tag CLI ────────────────────────────────────────────────────────────
     elif "--tag" in sys.argv:
         rest = sys.argv[sys.argv.index("--tag") + 1:]
@@ -2143,13 +2249,30 @@ if __name__ == "__main__":
     elif "--load" in sys.argv:
         idx = sys.argv.index("--load")
         arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
-        sid = _resolve_session_or_tag(arg) if arg else ""
-        if sid:
-            chain_f   = CLEXO_DIR / f"chain-{sid}.md"
-            refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
-            if not chain_f.exists() and not refresh_f.exists():
-                refresh_save(sid)
-        print(_refresh_load(sid))
+        if not arg:
+            print("Usage: server.py --load <tag-or-uuid>", file=sys.stderr)
+            sys.exit(1)
+        sid = _resolve_session_or_tag(arg)
+        if not _TAG_UUID_RE.match(sid.lower()):
+            print(f"'{arg}' is not a complete UUID (need 36 chars, "
+                  f"8-4-4-4-12) and not a known tag. "
+                  f"Run `clexo tags` to list, or check that the sid wasn't truncated.",
+                  file=sys.stderr)
+            sys.exit(1)
+        chain_f   = CLEXO_DIR / f"chain-{sid}.md"
+        refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
+        if not chain_f.exists() and not refresh_f.exists():
+            save_result = refresh_save(sid)
+            if save_result.startswith("No session JSONL"):
+                print(save_result, file=sys.stderr)
+                sys.exit(1)
+        REFRESH_PENDING.write_text(sid)
+        # TTY → exec claude (fresh session; SessionStart hook injects snapshot).
+        # Non-tty → print the command paste-ready.
+        if sys.stdout.isatty():
+            os.execvp("claude", ["claude"])
+        else:
+            print(f"Snapshot ready for {sid}. Run: claude")
     elif "--resume" in sys.argv:
         idx = sys.argv.index("--resume")
         if idx + 1 >= len(sys.argv):
@@ -2158,12 +2281,37 @@ if __name__ == "__main__":
         name = sys.argv[idx + 1]
         sid = _resolve_session_or_tag(name)
         if not _TAG_UUID_RE.match(sid.lower()):
-            print(f"Unknown tag '{name}'. Run `clexo tags` to list.", file=sys.stderr)
+            print(f"'{name}' is not a complete UUID (need 36 chars, "
+                  f"8-4-4-4-12) and not a known tag. "
+                  f"Run `clexo tags` to list.", file=sys.stderr)
             sys.exit(1)
         # TTY → exec claude --resume; otherwise print the command paste-ready.
         if sys.stdout.isatty():
             os.execvp("claude", ["claude", "--resume", sid])
         else:
             print(f"claude --resume {sid}")
+    elif "--install-hooks" in sys.argv:
+        print(_install_hooks())
+    elif "--show" in sys.argv:
+        idx = sys.argv.index("--show")
+        arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
+        if not arg:
+            print("Usage: server.py --show <tag-or-uuid>", file=sys.stderr)
+            sys.exit(1)
+        sid = _resolve_session_or_tag(arg)
+        if not _TAG_UUID_RE.match(sid.lower()):
+            print(f"'{arg}' is not a complete UUID and not a known tag.",
+                  file=sys.stderr)
+            sys.exit(1)
+        # Ensure a snapshot exists, then print it without touching REFRESH_PENDING
+        # (so we don't accidentally schedule a restore on the next claude startup).
+        chain_f   = CLEXO_DIR / f"chain-{sid}.md"
+        refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
+        if not chain_f.exists() and not refresh_f.exists():
+            save_result = refresh_save(sid)
+            if save_result.startswith("No session JSONL"):
+                print(save_result, file=sys.stderr)
+                sys.exit(1)
+        print(_refresh_load(sid))
     else:
         _run_server()

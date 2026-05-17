@@ -113,15 +113,24 @@ if ! printf ":%s:" "$PATH" | grep -q ":$BINDIR:"; then
   echo "      ${C_DIM}export PATH=\"\$HOME/.local/bin:\$PATH\"${C_OFF}"
 fi
 
-# ── 5. Hook snippet (manual merge — JSON merging is risky) ───────────────────
+# ── 5. SessionStart + SessionEnd hooks ───────────────────────────────────────
 step "Optional: SessionStart + SessionEnd hooks"
 echo "  SessionStart auto-restores the last saved session after /clear."
 echo "  SessionEnd keeps the FTS index fresh in the background."
-echo "  Merge this into ~/.claude/settings.json (under \"hooks\"):"
+echo "  These modify ~/.claude/settings.json (existing file is backed up first;"
+echo "  install is idempotent — skips if already wired)."
 echo
-cat <<EOF
+if ask "Install hooks into ~/.claude/settings.json now?"; then
+  python3 "$SERVER" --install-hooks
+else
+  echo "  Skipped. Install later with:"
+  echo "      ${C_BOLD}clexo install-hooks${C_OFF}"
+  echo "  (enables auto-restore after /clear and starts a new session;"
+  echo "   keeps the FTS index fresh between sessions)."
+  echo "  Or merge this snippet manually into ~/.claude/settings.json:"
+  cat <<EOF
 ${C_DIM}    "SessionStart": [{
-      "matcher": "clear",
+      "matcher": "startup|clear",
       "hooks": [{
         "type": "command",
         "command": "python3 $SERVER --session-start"
@@ -135,6 +144,7 @@ ${C_DIM}    "SessionStart": [{
       }]
     }]${C_OFF}
 EOF
+fi
 
 echo
 ok "${C_BOLD}Install complete.${C_OFF} Try: ${C_BOLD}clexo help${C_OFF}"

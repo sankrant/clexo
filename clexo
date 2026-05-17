@@ -41,11 +41,18 @@ case "$cmd" in
     "$PYTHON" "$SERVER" --untag "$@"
     ;;
   load)
-    "$PYTHON" "$SERVER" --load "$@"
+    # exec so claude inherits the tty cleanly when --load execs `claude`
+    exec "$PYTHON" "$SERVER" --load "$@"
     ;;
   resume)
     # exec so claude inherits the tty cleanly
     exec "$PYTHON" "$SERVER" --resume "$@"
+    ;;
+  show)
+    "$PYTHON" "$SERVER" --show "$@"
+    ;;
+  install-hooks)
+    "$PYTHON" "$SERVER" --install-hooks
     ;;
   help|--help|-h)
     echo "Usage: clexo <command>"
@@ -61,8 +68,16 @@ case "$cmd" in
     echo "                       Tag current (or given) session; --force to replace"
     echo "  tags                 List all tags with session info"
     echo "  untag <name>         Remove a tag"
-    echo "  load <name|sid>      Load a saved snapshot by tag or UUID"
-    echo "  resume <name|sid>    Exec 'claude --resume <uuid>' (resolves tag first)"
+    echo "  load <name|sid>      Set pending snapshot + launch claude (fresh"
+    echo "                       session; SessionStart hook injects snapshot)"
+    echo "  resume <name|sid>    Exec 'claude --resume <uuid>' (reopens original"
+    echo "                       session, not via snapshot)"
+    echo "  show <name|sid>      Print the saved snapshot to stdout (inspect only)"
+    echo ""
+    echo "Setup:"
+    echo "  install-hooks        Wire SessionStart + SessionEnd hooks into"
+    echo "                       ~/.claude/settings.json (backs up first;"
+    echo "                       idempotent; enables auto-restore after /clear)"
     ;;
   *)
     echo "Unknown command: $cmd  (try: clexo help)" >&2

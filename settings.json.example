@@ -4,8 +4,8 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "clear",
-        "_comment": "Restores the pending session snapshot when a new session starts after /clear",
+        "matcher": "startup|clear",
+        "_comment": "Restores the pending session snapshot on a fresh claude startup or after /clear",
         "hooks": [
           {
             "type": "command",
