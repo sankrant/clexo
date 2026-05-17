@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# clexo CLI — wrapper around server.py
+# Resolve symlink chain so `ln -s .../clexo ~/.local/bin/clexo` still finds server.py.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+SERVER="$SCRIPT_DIR/server.py"
+PYTHON="python3"
+
+cmd="${1:-help}"
+shift 2>/dev/null
+
+case "$cmd" in
+  stats|gain)
+    "$PYTHON" "$SERVER" stats
+    ;;
+  sync)
+    "$PYTHON" "$SERVER" --sync
+    ;;
+  search)
+    "$PYTHON" "$SERVER" --search "$@"
+    ;;
+  save)
+    # Default to the current Claude Code session if no sid passed; otherwise
+    # the most-recent-mtime heuristic in server.py can pick a parallel
+    # Agent-spawned session JSONL instead of ours.
+    "$PYTHON" "$SERVER" --save "${1:-$CLAUDE_CODE_SESSION_ID}"
+    ;;
+  # ── Tag commands ──────────────────────────────────────────────────────
+  tag)
+    "$PYTHON" "$SERVER" --tag "$@"
+    ;;
+  tags)
+    "$PYTHON" "$SERVER" --tags
+    ;;
+  untag)
+    "$PYTHON" "$SERVER" --untag "$@"
+    ;;
+  load)
+    "$PYTHON" "$SERVER" --load "$@"
+    ;;
+  resume)
+    # exec so claude inherits the tty cleanly
+    exec "$PYTHON" "$SERVER" --resume "$@"
+    ;;
+  help|--help|-h)
+    echo "Usage: clexo <command>"
+    echo ""
+    echo "Commands:"
+    echo "  stats / gain         Show usage stats"
+    echo "  sync                 Index new messages now"
+    echo "  search <query>       Search chat history"
+    echo "  save [sid|tag]       Snapshot current (or given) session for restore"
+    echo ""
+    echo "Tags:"
+    echo "  tag <name> [--force] [sid]"
+    echo "                       Tag current (or given) session; --force to replace"
+    echo "  tags                 List all tags with session info"
+    echo "  untag <name>         Remove a tag"
+    echo "  load <name|sid>      Load a saved snapshot by tag or UUID"
+    echo "  resume <name|sid>    Exec 'claude --resume <uuid>' (resolves tag first)"
+    ;;
+  *)
+    echo "Unknown command: $cmd  (try: clexo help)" >&2
+    exit 1
+    ;;
+esac

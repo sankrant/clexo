@@ -1,0 +1,30 @@
+{
+  "_comment": "Minimal example showing the SessionStart + SessionEnd hooks clexo uses. Merge these into your ~/.claude/settings.json — replace /absolute/path/to/clexo with where you cloned this repo. JSON does not support comments; remove the _comment keys before use.",
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "clear",
+        "_comment": "Restores the pending session snapshot when a new session starts after /clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/clexo/server.py --session-start"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "_comment": "Keeps the FTS index fresh in the background after each session",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'python3 /absolute/path/to/clexo/server.py --sync >> /tmp/clexo-sync.log 2>&1 &'"
+          }
+        ]
+      }
+    ]
+  }
+}

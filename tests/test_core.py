@@ -1,0 +1,405 @@
+"""Core tests for clexo server functions."""
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+# Add parent to path so we can import server directly
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import server
+
+
+# ── DB / sync ─────────────────────────────────────────────────────────────────
+
+def test_get_db_creates_tables():
+    db = server.get_db()
+    tables = {r[0] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    assert "messages" in tables
+    assert "sessions" in tables
+    assert "file_state" in tables
+
+
+def test_sync_all_returns_int():
+    db = server.get_db()
+    result = server.sync_all(db)
+    assert isinstance(result, int)
+    assert result >= 0
+
+
+def test_db_has_indexed_sessions():
+    db = server.get_db()
+    count = db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    assert count > 0, "Expected at least one indexed session"
+
+
+# ── Search ────────────────────────────────────────────────────────────────────
+
+def test_search_returns_results():
+    result = server._search("refresh")
+    assert "Found" in result or "No results" in result
+
+
+def test_search_finds_known_term():
+    result = server._search("clexo")
+    # We've discussed clexo in recent sessions — should find something
+    assert "No results" not in result or "claudex" in result.lower()
+
+
+def test_search_source_filter():
+    result = server._search("refresh", source_filter="claude")
+    assert "[codex]" not in result.lower() or "No results" in result
+
+
+def test_search_bad_query_returns_error_not_exception():
+    # Explicit FTS5 operator-only query — should return error string, not raise
+    result = server._search("AND OR NOT")
+    assert isinstance(result, str)
+
+def test_search_special_chars_in_query():
+    # Dots, slashes etc. should not crash (auto-quoted)
+    result = server._search("CsrfTokenController.php")
+    assert isinstance(result, str)
+    assert not result.startswith("Search error")
+
+
+def test_search_no_results():
+    result = server._search("xyzzy_no_such_term_qqqq")
+    assert "No results" in result
+
+
+# ── Refresh load ──────────────────────────────────────────────────────────────
+
+def _isolate_clexo_dir(tmp_path, monkeypatch):
+    """Redirect every CLEXO_DIR-derived path constant to tmp_path so the
+    refresh-pending file, chain-loaded marker, and DB don't bleed across
+    runs. Module-level constants don't follow CLEXO_DIR after import, so
+    they must be patched explicitly."""
+    monkeypatch.setattr(server, "CLEXO_DIR",        tmp_path)
+    monkeypatch.setattr(server, "DB_PATH",          tmp_path / "index.db")
+    monkeypatch.setattr(server, "REFRESH_PENDING",  tmp_path / "refresh-pending")
+    monkeypatch.setattr(server, "_CHAIN_LOADED",    tmp_path / "chain-loaded")
+
+
+def test_refresh_load_no_pending(tmp_path, monkeypatch):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    result = server._refresh_load()
+    assert "No saved sessions found" in result
+
+
+def test_refresh_load_with_pending(tmp_path, monkeypatch):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "test-session-1234"
+    content = "# Refresh Context — 2026-05-06 — claude: test-session-1234\n\n## Summary\n- test entry\n"
+    (tmp_path / f"refresh-{sid}.md").write_text(content)
+    (tmp_path / "refresh-pending").write_text(sid)
+    result = server._refresh_load()
+    assert "# Refresh Context" in result
+    assert "Previous session context" in result
+    assert not (tmp_path / "refresh-pending").exists()
+
+
+def test_refresh_load_clears_pending(tmp_path, monkeypatch):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "abc123"
+    (tmp_path / f"refresh-{sid}.md").write_text("# Refresh Context — 2026-05-06 — claude: abc123\n\n## Summary\n- something\n")
+    (tmp_path / "refresh-pending").write_text(sid)
+    server._refresh_load()
+    assert not (tmp_path / "refresh-pending").exists()
+
+
+def test_refresh_load_missing_file(tmp_path, monkeypatch):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    (tmp_path / "refresh-pending").write_text("nonexistent-uuid")
+    result = server._refresh_load()
+    assert "not found" in result
+
+
+# ── Session start hook ────────────────────────────────────────────────────────
+
+def test_session_start_hook_no_pending(tmp_path, monkeypatch, capsys):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    server._session_start_hook()
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert data == {}
+
+
+def test_session_start_hook_with_pending(tmp_path, monkeypatch, capsys):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "test-uuid-hook"
+    content = "# Refresh Context — 2026-05-06 — claude: test-uuid-hook\n\n## Summary\n- hook test session\n"
+    (tmp_path / f"refresh-{sid}.md").write_text(content)
+    (tmp_path / "refresh-pending").write_text(sid)
+    server._session_start_hook()
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert data["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "↺" in data["systemMessage"]
+    assert "2026-05-06" in data["systemMessage"]
+    assert "hook test session" in data["systemMessage"]
+    assert "Previous session context" in data["hookSpecificOutput"]["additionalContext"]
+
+
+# ── Tags ──────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def isolated_db(tmp_path, monkeypatch):
+    """Isolated sqlite DB so tag CRUD tests don't pollute ~/.clexo/index.db."""
+    monkeypatch.setattr(server, "DB_PATH", tmp_path / "test.db")
+    return server.get_db()
+
+
+def test_tags_table_created(isolated_db):
+    tables = {r[0] for r in isolated_db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    assert "tags" in tables
+
+
+def test_validate_tag_accepts_valid():
+    assert server._validate_tag("my-auth-fix") is None
+    assert server._validate_tag("foo_bar123") is None
+    assert server._validate_tag("a") is None
+
+
+def test_validate_tag_rejects_empty():
+    assert server._validate_tag("") is not None
+    assert server._validate_tag("   ") is not None
+
+
+def test_validate_tag_rejects_uuid_shape():
+    err = server._validate_tag("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    assert err and "uuid" in err.lower()
+
+
+def test_validate_tag_rejects_bad_chars():
+    assert server._validate_tag("has space") is not None
+    assert server._validate_tag("foo!") is not None
+    assert server._validate_tag("-foo") is not None
+    assert server._validate_tag("foo/bar") is not None
+
+
+def test_validate_tag_normalizes_case():
+    # MixedCase is silently lowercased rather than rejected.
+    assert server._validate_tag("MixedCase") is None
+
+
+def test_create_and_resolve_tag(isolated_db):
+    sid = "11111111-2222-3333-4444-555555555555"
+    out = server._create_tag("alpha", sid)
+    assert "Tagged" in out
+    assert server._resolve_tag("alpha") == sid
+
+
+def test_tag_normalizes_case(isolated_db):
+    sid = "11111111-2222-3333-4444-555555555555"
+    # Mixed case is silently lowercased on create and on lookup.
+    server._create_tag("Alpha", sid)
+    assert server._resolve_tag("alpha") == sid
+    assert server._resolve_tag("ALPHA") == sid
+
+
+def test_tag_collision_without_replace(isolated_db):
+    sid1 = "11111111-2222-3333-4444-555555555555"
+    sid2 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    server._create_tag("beta", sid1)
+    out = server._create_tag("beta", sid2)
+    assert "already exists" in out
+    assert server._resolve_tag("beta") == sid1  # unchanged
+
+
+def test_tag_replace_overwrites(isolated_db):
+    sid1 = "11111111-2222-3333-4444-555555555555"
+    sid2 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    server._create_tag("gamma", sid1)
+    out = server._create_tag("gamma", sid2, replace=True)
+    assert "Replaced" in out
+    assert server._resolve_tag("gamma") == sid2
+
+
+def test_tag_same_session_idempotent(isolated_db):
+    sid = "11111111-2222-3333-4444-555555555555"
+    server._create_tag("eta", sid)
+    out = server._create_tag("eta", sid)
+    assert "already points at this session" in out
+
+
+def test_many_tags_per_session(isolated_db):
+    sid = "11111111-2222-3333-4444-555555555555"
+    server._create_tag("one", sid)
+    server._create_tag("two", sid)
+    assert server._resolve_tag("one") == sid
+    assert server._resolve_tag("two") == sid
+
+
+def test_untag(isolated_db):
+    sid = "11111111-2222-3333-4444-555555555555"
+    server._create_tag("delta", sid)
+    out = server._remove_tag("delta")
+    assert "Removed" in out
+    assert server._resolve_tag("delta") is None
+
+
+def test_untag_nonexistent(isolated_db):
+    out = server._remove_tag("no-such-tag")
+    assert "No tag" in out
+
+
+def test_resolve_session_or_tag_uuid_passthrough(isolated_db):
+    uuid = "11111111-2222-3333-4444-555555555555"
+    assert server._resolve_session_or_tag(uuid) == uuid
+
+
+def test_resolve_session_or_tag_lookup(isolated_db):
+    sid = "11111111-2222-3333-4444-555555555555"
+    server._create_tag("epsilon", sid)
+    assert server._resolve_session_or_tag("epsilon") == sid
+
+
+def test_resolve_session_or_tag_unknown_passthrough(isolated_db):
+    assert server._resolve_session_or_tag("unknown-name") == "unknown-name"
+
+
+def test_format_tags_empty(isolated_db):
+    assert "No tags yet" in server._format_tags()
+
+
+def test_format_tags_with_entries(isolated_db):
+    sid = "11111111-2222-3333-4444-555555555555"
+    server._create_tag("zeta", sid)
+    out = server._format_tags()
+    assert "@zeta" in out
+    assert sid in out
+
+
+def test_create_tag_rejects_bad_uuid(isolated_db):
+    out = server._create_tag("badsid", "not-a-uuid")
+    assert "doesn't look like a UUID" in out
+
+
+# ── Keyword extraction & chain summary ────────────────────────────────────────
+
+def test_session_keywords_basic(isolated_db):
+    sid = "11111111-2222-3333-4444-555555555555"
+    # Seed a small session: the topic word "encryption" appears multiple times,
+    # stopwords + singletons should be filtered out.
+    rows = [
+        (sid, "p", "user",      "we need to add encryption to the storage layer", "t1"),
+        (sid, "p", "assistant", "okay — encryption can use AES or chacha20",      "t2"),
+        (sid, "p", "user",      "let's go with AES encryption for the storage",  "t3"),
+        (sid, "p", "assistant", "AES it is",                                      "t4"),
+    ]
+    for r in rows:
+        isolated_db.execute(
+            "INSERT INTO messages(session_id,project,role,content,ts) VALUES(?,?,?,?,?)", r
+        )
+    isolated_db.commit()
+    kws = server._session_keywords(isolated_db, sid, top=5)
+    assert "encryption" in kws
+    assert "storage" in kws
+    # Stopwords / fillers excluded
+    assert "the" not in kws
+    assert "okay" not in kws
+    # Singletons excluded (chacha20 appears only once)
+    assert "chacha20" not in kws
+
+
+def test_session_keywords_empty_for_missing_session(isolated_db):
+    assert server._session_keywords(isolated_db, "no-such-session") == []
+
+
+def test_session_keywords_idf_cache_is_reused(isolated_db):
+    sid = "11111111-2222-3333-4444-555555555555"
+    isolated_db.execute(
+        "INSERT INTO messages(session_id,project,role,content,ts) VALUES(?,?,?,?,?)",
+        (sid, "p", "user", "encryption encryption storage storage", "t1")
+    )
+    isolated_db.commit()
+    cache: dict = {}
+    server._session_keywords(isolated_db, sid, idf_cache=cache)
+    assert "encryption" in cache and "storage" in cache
+
+
+def test_chain_summary_extracts_section(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "CLEXO_DIR", tmp_path)
+    sid = "abc"
+    content = (
+        "## Session abc | 2026-05-17 | claude | x\n\n"
+        "### Summary\n"
+        "- Title: A useful session\n"
+        "- Opening: hello\n\n"
+        "### Key files\n"
+        "(none)\n"
+    )
+    (tmp_path / f"chain-{sid}.md").write_text(content)
+    out = server._chain_summary(sid)
+    assert "Title: A useful session" in out
+    assert "Key files" not in out
+
+
+def test_chain_summary_picks_last_in_chain(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "CLEXO_DIR", tmp_path)
+    sid = "abc"
+    content = (
+        "## Session old\n\n### Summary\n- old summary\n\n### Key files\n(none)\n\n"
+        "## Session abc\n\n### Summary\n- newer summary\n\n### Key files\n(none)\n"
+    )
+    (tmp_path / f"chain-{sid}.md").write_text(content)
+    out = server._chain_summary(sid)
+    assert "newer summary" in out
+    assert "old summary" not in out
+
+
+def test_chain_summary_returns_empty_when_no_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "CLEXO_DIR", tmp_path)
+    assert server._chain_summary("missing") == ""
+
+
+def test_resolve_current_uses_claude_sessions_when_env_unset(tmp_path, monkeypatch):
+    """When CLAUDE_CODE_SESSION_ID is unset, fall back to ~/.claude/sessions/*.json
+    matching $PWD rather than mtime-across-everything."""
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    fake_home = tmp_path
+    sessions_dir = fake_home / ".claude" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    project_cwd = "/Users/test/some-project"
+    monkeypatch.setenv("PWD", project_cwd)
+    monkeypatch.setattr(server.Path, "home", classmethod(lambda cls: fake_home))
+
+    target_sid = "abcd1234-aaaa-bbbb-cccc-dddddddddddd"
+    (sessions_dir / "active.json").write_text(json.dumps({
+        "sessionId": target_sid, "cwd": project_cwd,
+    }))
+    (sessions_dir / "other.json").write_text(json.dumps({
+        "sessionId": "ffff0000-aaaa-bbbb-cccc-dddddddddddd",
+        "cwd": "/Users/test/somewhere-else",
+    }))
+
+    sid, source = server._resolve_current_or_given_session()
+    assert sid == target_sid
+    assert source == "claude"
+
+
+def test_resolve_current_cwd_fallback_when_env_jsonl_missing(tmp_path, monkeypatch):
+    """If env CLAUDE_CODE_SESSION_ID is set but its JSONL doesn't exist (rare —
+    typically only in tests / stale env), fall through to cwd-match."""
+    fake_home = tmp_path
+    sessions_dir = fake_home / ".claude" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    project_cwd = "/Users/test/proj"
+    monkeypatch.setenv("PWD", project_cwd)
+    monkeypatch.setattr(server.Path, "home", classmethod(lambda cls: fake_home))
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID",
+                       "ffff0000-aaaa-bbbb-cccc-dddddddddddd")  # no JSONL
+    target_sid = "abcd1234-aaaa-bbbb-cccc-dddddddddddd"
+    (sessions_dir / "x.json").write_text(json.dumps({
+        "sessionId": target_sid, "cwd": project_cwd,
+    }))
+
+    sid, _ = server._resolve_current_or_given_session()
+    assert sid == target_sid
