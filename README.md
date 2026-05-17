@@ -1,8 +1,26 @@
 # clexo
 
-**Session memory and cross-AI context for Claude Code and Codex.** Search every past session, save and restore context across `/clear`, retrieve specific tool outputs from any prior conversation, and bookmark sessions with friendly names.
+> **Claude Code forgets. clexo remembers.**
+
+A meta-memory for Claude Code and Codex — searchable archive of every session, one-shot context restore across `/clear`, pinpoint retrieval of any past tool output, friendly tags so *"the auth fix from two weeks ago"* is one command away. `/clear` and `/exit` stop being a small loss; your sessions compound.
 
 Built by [Sankrant](https://github.com/sankrant).
+
+---
+
+## Why you'll want this
+
+If you live in Claude Code or Codex, three things hurt every day:
+
+1. **`/clear` anxiety.** You're about to lose the last hour of context. So you stall — or you skip clearing and hit the context cap mid-task instead. With `clexo save` → `/clear` → `clexo load`, the next session picks up where the last one left off.
+
+2. **The token re-explain tax.** Every new session starts by recapping what the previous one knew. Multiply by your daily session count and every project — the bill is real. A clexo snapshot is one-shot context, not a rebuild.
+
+3. **Lost work.** Yesterday's session held a working fix, a debugged config, a half-built plan. By the time you remember it existed, it's somewhere under `~/.claude/projects/**/*.jsonl` and you're grepping JSON. clexo gives you FTS across every session, including the raw tool outputs.
+
+And one structural gap worth naming: **Codex doesn't see Claude's history; Claude doesn't see Codex's.** clexo indexes both into one archive. Load a Codex session into Claude (or vice versa) without rewriting context.
+
+Zero daemon. No API key. Self-indexing on demand. Your AI sessions become a searchable meta-memory across every conversation you've ever had with them.
 
 ---
 
