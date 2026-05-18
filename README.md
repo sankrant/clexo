@@ -1,70 +1,136 @@
-# clexo
+<h1 align="center">clexo</h1>
 
-> **Claude Code forgets. clexo remembers.**
+<p align="center">
+  <strong>Session memory and cross-AI context for Claude Code and Codex</strong><br/>
+  <em>Claude Code forgets. clexo remembers.</em>
+</p>
 
-A meta-memory for Claude Code and Codex — searchable archive of every session, one-shot context restore across `/clear`, pinpoint retrieval of any past tool output, friendly tags so *"the auth fix from two weeks ago"* is one command away. `/clear` and `/exit` stop being a small loss; your sessions compound.
+<p align="center">
+  <a href="#-why">Why</a> •
+  <a href="#-quick-start">Quick Start</a> •
+  <a href="#-the-three-claude-code-operations-clexo-replaces">vs /compact /clear /resume</a> •
+  <a href="#-cli">CLI</a> •
+  <a href="#-mcp-tools">MCP</a> •
+  <a href="#-how-it-works">How it works</a>
+</p>
 
-Built by [Sankrant](https://github.com/sankrant).
+<p align="center">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"/>
+  <img src="https://img.shields.io/badge/python-3.10+-3776AB.svg" alt="Python"/>
+  <img src="https://img.shields.io/badge/MCP-ready-7C3AED.svg" alt="MCP"/>
+  <img src="https://img.shields.io/badge/Claude_Code-supported-D77757.svg" alt="Claude Code"/>
+  <img src="https://img.shields.io/badge/Codex-supported-1e293b.svg" alt="Codex"/>
+  <img src="https://img.shields.io/badge/zero-daemon-22c55e.svg" alt="Zero daemon"/>
+</p>
 
 ---
 
-## Why you'll want this
+> **Inside a Claude Code session, type `!clexo save`. Then `/clear`.**
+> The next session auto-restores the snapshot — summary + memory preserved, raw context cleared.
+> No `/compact` wait. No `claude --resume` reloading the full history. No `/clear` loss.
 
-If you live in Claude Code or Codex, three things hurt every day:
-
-1. **`/clear` anxiety.** You're about to lose the last hour of context. So you stall — or you skip clearing and hit the context cap mid-task instead. With `clexo save` → `/clear` → `clexo load`, the next session picks up where the last one left off.
-
-2. **The token re-explain tax.** Every new session starts by recapping what the previous one knew. Multiply by your daily session count and every project — the bill is real. A clexo snapshot is one-shot context, not a rebuild.
-
-3. **Lost work.** Yesterday's session held a working fix, a debugged config, a half-built plan. By the time you remember it existed, it's somewhere under `~/.claude/projects/**/*.jsonl` and you're grepping JSON. clexo gives you FTS across every session, including the raw tool outputs.
-
-And one structural gap worth naming: **Codex doesn't see Claude's history; Claude doesn't see Codex's.** clexo indexes both into one archive. Load a Codex session into Claude (or vice versa) without rewriting context.
-
-Zero daemon. No API key. Self-indexing on demand. Your AI sessions become a searchable meta-memory across every conversation you've ever had with them.
+<p align="center">
+  <img src="docs/demo.gif" alt="clexo save → /clear → auto-restored next session" width="720"/>
+</p>
 
 ---
 
-## What it does
+## ✨ Why
+
+If you live in Claude Code or Codex, three context operations all hurt. clexo replaces all three.
+
+|   | The pain | clexo replacement |
+|---|----------|-------------------|
+| 🐢 | **`/compact`** — 1-3 minutes on long sessions, blocks you in-session | `!clexo save` — ~80 ms snapshot, then `/clear` and continue |
+| 💸 | **`claude --resume <id>`** — re-loads the entire history into context | `clexo load <tag>` — restores the compact snapshot only |
+| 🪦 | **`/clear`** — irreversible, loses everything | `/clear` after `!clexo save` — auto-restored on next session |
+
+Plus one structural gap nothing else closes: **Codex doesn't see Claude's history; Claude doesn't see Codex's.** clexo indexes both into one archive — load a Codex session into Claude, or vice versa.
+
+Zero daemon. No API key. Self-indexing on demand. Your AI sessions become a searchable meta-memory across every prior conversation.
+
+---
+
+## 🚀 Quick Start
+
+```bash
+git clone https://github.com/sankrant/clexo
+cd clexo
+./install.sh
+```
+
+`install.sh` verifies Python 3.10+, installs the `mcp` dependency, registers the MCP server with Claude Code, symlinks the `clexo` CLI onto your PATH, and prompts before installing the SessionStart + SessionEnd hooks (recommended — they enable the auto-restore behavior).
+
+### Try it
+
+```bash
+# Inside a Claude Code session, drop a save and clear cleanly:
+!clexo save            # snapshot the current session (~80 ms)
+/clear                 # standard Claude Code; the next session auto-restores
+
+# From any terminal:
+clexo search "csrf token"        # FTS across every session, ever
+clexo tag auth-fix               # name the current session
+clexo load auth-fix              # launch a fresh claude, snapshot restored via hook
+clexo resume auth-fix            # or reopen the original session (claude --resume; full rehydrate)
+clexo stats                      # how many tokens you've saved so far
+```
+
+---
+
+## 🔁 The three Claude Code operations clexo replaces
+
+### `/compact` → `!clexo save`
+
+`/compact` re-summarises the entire conversation in place. On a long session it can take minutes — you sit and wait. `!clexo save` writes a compact snapshot to disk in milliseconds. You can `/clear` immediately and the next session auto-restores it.
+
+The `!` prefix matters: it runs `clexo save` as a bash command directly, bypassing the model entirely. Zero tokens consumed, no MCP round-trip, no AI cost — the fastest possible save. (You can also ask the agent to use the `save` MCP tool; that works but costs model tokens.)
+
+### `claude --resume <uuid>` → `clexo load <tag>`
+
+`claude --resume` rehydrates the *full* saved conversation back into context — every message, every tool call, every file read, up to the model's context window (200K on Sonnet, 1M on Opus). On a long session that's a slow rehydrate and your full context budget consumed before the first new turn. `clexo load` restores the saved snapshot (summary + recent exchanges + key file refs) — typically a few thousand tokens. Same continuity, a fraction of the context.
+
+### `/clear` → `/clear` (after `!clexo save`)
+
+`/clear` is normally irreversible. After `!clexo save`, it isn't: the SessionStart hook reads the pending snapshot when the next session starts and injects it as additional context. You keep summary + memory; you only lose the verbose raw history.
+
+---
+
+## 🧰 What it does
 
 - **Search** every Claude Code and Codex conversation you've ever had (FTS5)
-- **`save`** the current session into a compact snapshot and **`load`** it later — context survives `/clear` and crosses between Claude and Codex
+- **`save`** the current session into a compact snapshot, **`load`** it later — context survives `/clear` and crosses between Claude and Codex
 - **`pick`** raw exchanges (including bash output and file reads) from any past session
 - **`tag`** sessions with friendly names — `clexo resume my-auth-fix` jumps straight back into `claude --resume <uuid>`
-- **Zero daemon** — self-indexing via byte-offset tracking; one optional `SessionEnd` hook keeps things fresh
+- **Zero daemon** — self-indexing via byte-offset tracking; one optional `SessionEnd` hook keeps the index fresh
 
 ---
 
-## Quick start
+## ⚙️ Manual install
 
-### 1. Install dependencies
+If you'd rather not run the installer, the four steps it performs:
 
 ```bash
+# 1. Python dependency
 pip install -r requirements.txt
-```
 
-(Only `mcp` is required at runtime. Python 3.10+.)
-
-### 2. Register the MCP server with Claude Code
-
-```bash
+# 2. Register the MCP server with Claude Code
 claude mcp add --scope user clexo python3 /absolute/path/to/clexo/server.py
-```
 
-Verify with `claude mcp list` — you should see `clexo: ... ✓ Connected`.
-
-### 3. Put `clexo` on your PATH (optional, for the CLI)
-
-```bash
+# 3. Put the CLI on your PATH
 ln -s /absolute/path/to/clexo/clexo ~/.local/bin/clexo
+
+# 4. (Recommended) install the hooks — enables auto-restore after /clear
+clexo install-hooks
+#    or merge the hooks block from settings.json.example into
+#    ~/.claude/settings.json manually
 ```
 
-### 4. Add the SessionStart + SessionEnd hooks (optional, recommended)
-
-See `settings.json.example` — merge the hooks block into your `~/.claude/settings.json` (Claude Code's settings file, not this project's config). The `SessionStart` hook auto-restores the last saved snapshot; `SessionEnd` keeps the FTS index current.
+Verify the MCP server with `claude mcp list` — you should see `clexo: ... ✓ Connected`.
 
 ---
 
-## CLI
+## 💻 CLI
 
 ```
 clexo stats                          Show usage stats
@@ -75,15 +141,23 @@ clexo save [sid|tag]                 Snapshot the current (or given) session
 clexo tag <name> [--force] [sid]     Tag the current (or given) session
 clexo tags                           List tags with summary + keywords
 clexo untag <name>                   Remove a tag
-clexo load <name|sid>                Load a saved snapshot by tag or UUID
-clexo resume <name|sid>              Exec 'claude --resume <uuid>' (resolves tag first)
+clexo load <name|sid>                Set pending snapshot and launch a fresh claude
+                                     (SessionStart hook injects the snapshot)
+clexo resume <name|sid>              Exec 'claude --resume <uuid>' — reopens the
+                                     original session, full history (no snapshot)
+clexo show <name|sid>                Print the saved snapshot to stdout (inspect only)
+
+clexo install-hooks                  Wire SessionStart + SessionEnd hooks into
+                                     ~/.claude/settings.json (idempotent; backs up first)
 ```
+
+`load` vs `resume`: `load` is the clexo path — fresh session, compact snapshot, cheap context. `resume` is a friendly-name wrapper around `claude --resume <uuid>` — same session, full rehydrate, no clexo summarization.
 
 All commands work from anywhere — `!clexo tag my-fix` inside a Claude session tags that session.
 
 ---
 
-## MCP tools
+## 🔌 MCP tools
 
 When clexo is registered as an MCP server, Claude can invoke these directly. You usually don't call them manually — just say "search my history for X", "load my last session", "tag this as auth-fix".
 
@@ -100,7 +174,7 @@ When clexo is registered as an MCP server, Claude can invoke these directly. You
 
 ---
 
-## How it works
+## 🛠️ How it works
 
 - **Indexing** — SQLite FTS5 (porter tokenizer). Byte-offset tracking per JSONL file means syncs are O(new bytes), not O(file size). New messages are picked up on the next search; the optional `SessionEnd` hook runs `--sync` in the background.
 - **Source files** —
