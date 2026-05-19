@@ -85,6 +85,18 @@ def get_db() -> sqlite3.Connection:
     for col, dflt in [("source", "'claude'"), ("thread_name", "''"), ("summary", "NULL"), ("last_prompt", "''")]:
         if col not in existing:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT DEFAULT {dflt}")
+    if "prefix_delta_tokens" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN prefix_delta_tokens INTEGER DEFAULT 0")
+    # One-shot: split historical tokens_saved (compaction-only) into tokens_compacted.
+    done = conn.execute("SELECT 1 FROM stats WHERE key='migration_split_tokens'").fetchone()
+    if not done:
+        conn.execute("""
+            INSERT INTO stats(key, value)
+            SELECT 'tokens_compacted', value FROM stats WHERE key='tokens_saved'
+            ON CONFLICT(key) DO UPDATE SET value = stats.value + excluded.value
+        """)
+        conn.execute("DELETE FROM stats WHERE key='tokens_saved'")
+        conn.execute("INSERT OR IGNORE INTO stats(key, value) VALUES('migration_split_tokens', 1)")
     conn.commit()
     return conn
 
@@ -145,6 +157,13 @@ def _sync_claude(conn) -> int:
             project    = jsonl_file.parent.name
             new_offset = last_offset
 
+            delta_row = conn.execute(
+                "SELECT prefix_delta_tokens FROM sessions WHERE session_id = ?",
+                [session_id],
+            ).fetchone()
+            prefix_delta = (delta_row[0] if delta_row else 0) or 0
+            assistant_turns_this_pass = 0
+
             for raw_line, new_offset in _read_new_lines(jsonl_file, last_offset):
                 try:
                     obj = json.loads(raw_line.decode("utf-8", errors="replace"))
@@ -164,6 +183,8 @@ def _sync_claude(conn) -> int:
                             [session_id, project, role, text, ts]
                         )
                         total += 1
+                        if role == "assistant":
+                            assistant_turns_this_pass += 1
                         conn.execute("""
                             INSERT INTO sessions(session_id,project,first_user_msg,last_ts,cwd,source,thread_name,last_prompt)
                             VALUES(?,?,?,?,?,'claude','','')
@@ -202,6 +223,12 @@ def _sync_claude(conn) -> int:
                             [lp[:200], session_id])
 
             conn.execute("INSERT OR REPLACE INTO file_state VALUES(?,?)", [fp, new_offset])
+
+            if prefix_delta > 0 and assistant_turns_this_pass > 0:
+                conn.execute("""
+                    INSERT INTO stats(key, value) VALUES('tokens_saved', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = value + excluded.value
+                """, [prefix_delta * assistant_turns_this_pass])
         except Exception as e:
             if _debug_enabled():
                 print(f"[clexo sync claude] {jsonl_file}: {e}", file=sys.stderr)
@@ -535,6 +562,46 @@ def _normalize_tag(name: str) -> str:
     return (name or "").strip().lower()
 
 
+_TAG_STOP_WORDS = {
+    "how", "what", "why", "can", "could", "would", "will", "should",
+    "do", "does", "did", "is", "are", "was", "were", "the", "a", "an",
+    "please", "hey", "hi", "ok", "okay", "just", "also", "now",
+    "let", "lets", "help", "me", "you", "i", "we", "us",
+    "to", "of", "for", "in", "on", "at", "and", "or", "but",
+    "this", "that", "these", "those", "it", "its",
+    "ill", "im", "ive", "be", "been", "have", "has", "had",
+}
+
+
+def _slugify_words(text: str, max_words: int = 3, max_chars: int = 24) -> str:
+    """Free text → tag-friendly slug. Strips stop words, picks leading content
+    words, joins with '-', enforces length cap. Returns '' if no usable words."""
+    if not text:
+        return ""
+    s = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    words = [w for w in s.split() if w not in _TAG_STOP_WORDS and len(w) >= 2]
+    out = ""
+    for w in words[:max_words]:
+        candidate = (out + "-" + w) if out else w
+        if len(candidate) > max_chars:
+            break
+        out = candidate
+    return out
+
+
+def _project_slug(project: str, cwd: str) -> str:
+    """Derive a short project name from cwd (preferred) or the encoded JSONL
+    project dir name. Returns '' if nothing usable."""
+    name = ""
+    if cwd:
+        name = Path(cwd).name
+    elif project:
+        parts = [p for p in project.split("-") if p]
+        cands = [p for p in parts if any(c.isalpha() for c in p) and len(p) >= 3]
+        name = cands[-1] if cands else (parts[-1] if parts else "")
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
 def _validate_tag(name: str) -> str | None:
     """Return None if valid, else an error string describing why it isn't."""
     if not name or not name.strip():
@@ -546,6 +613,80 @@ def _validate_tag(name: str) -> str | None:
         return ("Tag must be 1–64 chars of [a-z0-9_-], starting with a letter or digit "
                 f"(got: {name!r}).")
     return None
+
+
+def _auto_tag_for_session(session_id: str, thread_name: str, first_user_msg: str,
+                          project: str, cwd: str, db) -> str | None:
+    """Generate a candidate tag name for the session.
+
+    Returns None if the session is already tagged or no usable name can be built.
+    Picks topic from thread_name → first_user_msg → timestamp fallback. Prepends
+    a project slug unless it already appears in the topic. On name collisions,
+    appends `-2`, `-3`, … up to `-999`.
+    """
+    existing = db.execute(
+        "SELECT 1 FROM tags WHERE session_id=? LIMIT 1", [session_id]
+    ).fetchone()
+    if existing:
+        return None
+
+    proj  = _project_slug(project or "", cwd or "")
+    topic = _slugify_words(thread_name or "") or _slugify_words(first_user_msg or "")
+    if not topic:
+        topic = datetime.datetime.now().strftime("save-%Y%m%d-%H%M")
+
+    if proj and proj in topic.split("-"):
+        candidate = topic
+    elif proj:
+        candidate = f"{proj}-{topic}"
+    else:
+        candidate = topic
+    candidate = candidate.lstrip("-_")[:30].rstrip("-")
+    if not candidate or _validate_tag(candidate):
+        return None
+
+    base = candidate
+    n = 2
+    while db.execute("SELECT 1 FROM tags WHERE tag=? LIMIT 1", [candidate]).fetchone():
+        suffix = f"-{n}"
+        candidate = (base[: 30 - len(suffix)] + suffix).rstrip("-")
+        if _validate_tag(candidate):
+            return None
+        n += 1
+        if n > 999:
+            return None
+    return candidate
+
+
+def _apply_auto_tag(session_id: str, db) -> str | None:
+    """Generate and insert an auto-tag for the session if it has none yet.
+
+    Returns the tag name on success, or None if already tagged or no usable
+    name can be built. Shared by `refresh_save` (auto-tag on first save) and
+    bare `clexo tag` (auto-tag on demand).
+    """
+    sess = db.execute(
+        "SELECT thread_name, first_user_msg, project, cwd "
+        "FROM sessions WHERE session_id=?",
+        [session_id],
+    ).fetchone()
+    candidate = _auto_tag_for_session(
+        session_id,
+        (sess[0] if sess else "") or "",
+        (sess[1] if sess else "") or "",
+        (sess[2] if sess else "") or "",
+        (sess[3] if sess else "") or "",
+        db,
+    )
+    if not candidate:
+        return None
+    now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    db.execute(
+        "INSERT OR IGNORE INTO tags(tag, session_id, created_ts) VALUES(?,?,?)",
+        [candidate, session_id, now],
+    )
+    db.commit()
+    return candidate
 
 
 def _resolve_current_or_given_session(session_id: str = "") -> tuple[str, str]:
@@ -1241,7 +1382,8 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
         return "No session JSONL found."
 
     sess = db.execute(
-        "SELECT summary, first_user_msg, last_prompt, thread_name FROM sessions WHERE session_id=?",
+        "SELECT summary, first_user_msg, last_prompt, thread_name, project, cwd "
+        "FROM sessions WHERE session_id=?",
         [session_id]
     ).fetchone()
     if sess and sess[0]:
@@ -1327,12 +1469,12 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
             break
     selected.reverse()
 
-    tokens_saved = max(0, (full_chars - total) // 4)
+    tokens_compacted = max(0, (full_chars - total) // 4)
     try:
         db.execute("""
-            INSERT INTO stats(key, value) VALUES('tokens_saved', ?)
+            INSERT INTO stats(key, value) VALUES('tokens_compacted', ?)
             ON CONFLICT(key) DO UPDATE SET value = value + excluded.value
-        """, [tokens_saved])
+        """, [tokens_compacted])
         db.commit()
     except Exception:
         pass
@@ -1382,11 +1524,22 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
     _stat("refresh_saves", conn=db)
 
     total_chars = len(prior_content) + len(new_section)
-    chain_label = " (chain: appended)" if prior_content else " (chain: new)"
-    return (
-        f"Saved {total_chars:,} chars{chain_label} · session {session_id} [{source}]\n"
-        f"Run /clear — context auto-restores on your next message."
-    )
+    snap_tok = total_chars // 4
+    src_tok  = full_chars // 4
+
+    try:
+        auto_tag = _apply_auto_tag(session_id, db)
+    except Exception:
+        auto_tag = None
+
+    lines = [f"Wrote snapshot: {total_chars:,} chars ≈ {_human_count(snap_tok)} tokens"]
+    if src_tok > snap_tok and src_tok > 0:
+        pct = round((1 - snap_tok / src_tok) * 100)
+        lines.append(f"Compacted from ~{_human_count(src_tok)} msg tokens ({pct}% smaller)")
+    if auto_tag:
+        lines.append(f"Tagged '{auto_tag}'")
+    lines.append("Run /clear — snapshot auto-restores on next message.")
+    return "\n".join(lines)
 
 
 # ── MCP server ────────────────────────────────────────────────────────────────
@@ -1670,6 +1823,10 @@ def _run_server():
         pending restore. The next time a new session starts, the SessionStart
         hook auto-loads this snapshot.
 
+        On the first save of a previously untagged session, also generates an
+        auto-tag (e.g. `project-topic-words`) so the snapshot is reachable by a
+        memorable name without copying the UUID.
+
         Use when the user asks to save ("save this session", "save"), is about
         to clear context, or context is getting long enough to warrant a
         checkpoint.
@@ -1800,19 +1957,16 @@ def _run_server():
 
     @app.tool()
     def get_stats() -> str:
-        """Return clexo usage stats."""
+        """Return clexo usage stats.
+
+        Includes index size (sessions + messages), two separate token-savings
+        counters — `tokens_compacted` (one-shot, credited at save time) and
+        `tokens_saved` (per-turn, credited for each assistant message in a
+        snapshot-loaded session) — and call counts for saves, loads, picks,
+        searches, and tags.
+        """
         try:
-            rows = {r[0]: r[1] for r in db.execute("SELECT key, value FROM stats").fetchall()}
-            sessions = db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-            return "\n".join([
-                f"Sessions indexed:   {sessions:>6,}",
-                f"Messages indexed:   {rows.get('messages_indexed', 0):>6,}",
-                f"Saves:              {rows.get('refresh_saves',    0):>6,}",
-                f"Loads:              {rows.get('refresh_loads',    0):>6,}",
-                f"Tokens saved:       {rows.get('tokens_saved',     0):>6,}",
-                f"Pick uses:          {rows.get('pick_uses',        0):>6,}",
-                f"Search calls:       {rows.get('search_calls',     0):>6,}",
-            ])
+            return _format_stats()
         except Exception as e:
             return f"Stats unavailable: {e}"
 
@@ -1979,6 +2133,16 @@ def _session_start_hook() -> None:
     # Peek at pending before _refresh_load clears it — needed for chain handoff
     loaded_sid = REFRESH_PENDING.read_text().strip()
 
+    # New session id from hook stdin payload (Claude Code passes session_id).
+    new_sid = ""
+    try:
+        if not sys.stdin.isatty():
+            raw = sys.stdin.read()
+            if raw.strip():
+                new_sid = (json.loads(raw).get("session_id") or "").strip()
+    except Exception:
+        new_sid = ""
+
     content = _refresh_load()
 
     if not re.search(r'^## Session', content, re.MULTILINE) and "# Refresh Context" not in content:
@@ -1988,6 +2152,34 @@ def _session_start_hook() -> None:
     # Write handoff file so save() in this process knows which chain to extend
     if loaded_sid:
         _CHAIN_LOADED.write_text(loaded_sid)
+
+    # Stamp the new session with the per-turn prefix delta for this load:
+    # (full original JSONL bytes − snapshot bytes) / 4. Each subsequent
+    # assistant turn in this new session will credit `delta` to tokens_saved
+    # during sync, capturing the compounding prefix-replay savings.
+    if new_sid and loaded_sid and new_sid != loaded_sid:
+        try:
+            chain_f   = CLEXO_DIR / f"chain-{loaded_sid}.md"
+            refresh_f = CLEXO_DIR / f"refresh-{loaded_sid}.md"
+            snapshot_path = chain_f if chain_f.exists() else (refresh_f if refresh_f.exists() else None)
+            conn = get_db()
+            src_row = conn.execute(
+                "SELECT COALESCE(source,'claude') FROM sessions WHERE session_id = ?",
+                [loaded_sid],
+            ).fetchone()
+            src = (src_row[0] if src_row else "claude") or "claude"
+            jsonl_path = _find_session_jsonl(loaded_sid, source=src)
+            if snapshot_path and jsonl_path:
+                delta = max(0, (jsonl_path.stat().st_size - snapshot_path.stat().st_size) // 4)
+                if delta > 0:
+                    conn.execute("""
+                        INSERT INTO sessions(session_id, prefix_delta_tokens)
+                        VALUES(?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET prefix_delta_tokens = excluded.prefix_delta_tokens
+                    """, [new_sid, delta])
+                    conn.commit()
+        except Exception:
+            pass
 
     lines = content.splitlines()
 
@@ -2182,20 +2374,65 @@ def _install_hooks(settings_path: Path | None = None) -> str:
     return "\n".join(out_lines)
 
 
+def _human_count(n: int) -> str:
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 10_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{n:,}"
+
+
+def _format_stats() -> str:
+    db = get_db()
+    rows = {r[0]: r[1] for r in db.execute("SELECT key, value FROM stats").fetchall()}
+    sessions = db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    by_source = dict(db.execute(
+        "SELECT COALESCE(source,'claude'), COUNT(*) FROM sessions GROUP BY source"
+    ).fetchall())
+    tag_count = db.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
+
+    messages  = rows.get("messages_indexed", 0)
+    saves     = rows.get("refresh_saves",    0)
+    loads     = rows.get("refresh_loads",    0)
+    compacted = rows.get("tokens_compacted", 0)
+    saved     = rows.get("tokens_saved",     0)
+    picks     = rows.get("pick_uses",        0)
+    searches  = rows.get("search_calls",     0)
+
+    src_bits = []
+    if by_source.get("claude"):
+        src_bits.append(f"claude {by_source['claude']:,}")
+    if by_source.get("codex"):
+        src_bits.append(f"codex {by_source['codex']:,}")
+    src_suffix = f"  ({' · '.join(src_bits)})" if src_bits else ""
+
+    ctx_equiv = saved / 200_000
+    ctx_suffix = f"  (≈ {ctx_equiv:.0f}× 200k ctx)" if ctx_equiv >= 1 else ""
+
+    rule = "─" * 40
+    lines = [
+        "clexo gain — Global",
+        rule,
+        f"Sessions indexed:   {sessions:>6,}{src_suffix}",
+        f"Messages indexed:   {messages:>6,}",
+        f"Tokens compacted:   {_human_count(compacted):>6}  (one-shot at save time)",
+        f"Tokens saved:       {_human_count(saved):>6}{ctx_suffix}  (per-turn in loaded sessions)",
+        "",
+        "Activity",
+        f"  Saves     {saves:>5,}",
+        f"  Loads     {loads:>5,}",
+        f"  Picks     {picks:>5,}",
+        f"  Searches  {searches:>5,}",
+        f"  Tags      {tag_count:>5,}",
+    ]
+    return "\n".join(lines)
+
+
 def _print_stats() -> None:
     try:
-        db = get_db()
-        rows = {r[0]: r[1] for r in db.execute("SELECT key, value FROM stats").fetchall()}
-        sessions = db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-        print("\n".join([
-            f"Sessions indexed:   {sessions:>6,}",
-            f"Messages indexed:   {rows.get('messages_indexed', 0):>6,}",
-            f"Saves:              {rows.get('refresh_saves',    0):>6,}",
-            f"Loads:              {rows.get('refresh_loads',    0):>6,}",
-            f"Tokens saved:       {rows.get('tokens_saved',     0):>6,}",
-            f"Pick uses:          {rows.get('pick_uses',        0):>6,}",
-            f"Search calls:       {rows.get('search_calls',     0):>6,}",
-        ]))
+        print(_format_stats())
     except Exception as e:
         print(f"Stats unavailable: {e}", file=sys.stderr)
         sys.exit(1)
@@ -2235,8 +2472,36 @@ if __name__ == "__main__":
     elif "--tag" in sys.argv:
         rest = sys.argv[sys.argv.index("--tag") + 1:]
         if not rest:
-            print("Usage: server.py --tag <name> [--force] [session_id]", file=sys.stderr)
-            sys.exit(1)
+            # Bare `clexo tag` — show current session's tag(s), or auto-generate one.
+            sid, _src = _resolve_current_or_given_session()
+            if not sid:
+                print("No current session found. Pass a name (`clexo tag <name>`) "
+                      "or run inside a Claude/Codex session.", file=sys.stderr)
+                sys.exit(1)
+            db = get_db()
+            rows = db.execute(
+                "SELECT tag, created_ts FROM tags WHERE session_id=? ORDER BY created_ts DESC",
+                [sid],
+            ).fetchall()
+            primary = None
+            if rows:
+                for t, ts in rows:
+                    ts_short = (ts or "")[:16].replace("T", " ")
+                    print(f"{t}  · created {ts_short}")
+                primary = rows[0][0]
+            else:
+                candidate = _apply_auto_tag(sid, db)
+                if candidate:
+                    print(f"Tagged '{candidate}'")
+                    primary = candidate
+                else:
+                    print("Could not generate a tag automatically. "
+                          "Run `clexo tag <name>`.", file=sys.stderr)
+                    sys.exit(1)
+            if primary:
+                print(f"  clexo resume {primary}   (full session)")
+                print(f"  clexo load   {primary}   (compacted snapshot)")
+            sys.exit(0)
         force = "--force" in rest
         positional = [a for a in rest if a != "--force"]
         name = positional[0] if positional else ""

@@ -36,6 +36,22 @@ Source session files (read-only — clexo never writes here):
 
 A typical snapshot is 5–20 KB — small enough to be lossless to load instantly.
 
+## What `save` prints
+
+```
+$ !clexo save
+Wrote snapshot: 14,961 chars ≈ 3.7K tokens
+Compacted from ~205K msg tokens (98% smaller)
+Tagged 'clexo-improve-gain'
+Run /clear — snapshot auto-restores on next message.
+```
+
+The "Compacted from …" line is dropped on tiny sessions where the snapshot skeleton
+(headers, file refs) makes the snapshot no smaller than the source. The "Tagged …"
+line only appears the first time a session is saved — subsequent saves on the same
+session reuse its existing tag rather than creating new ones. See
+[tags.md](tags.md#auto-tags) for the naming rules.
+
 ## The fast path: `!clexo save`
 
 Inside a Claude Code session, `!` is the bash escape — it runs a shell command directly,

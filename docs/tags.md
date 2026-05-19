@@ -3,7 +3,8 @@
 Sessions on disk are identified by UUID. Tags give you a human-readable handle.
 
 ```bash
-clexo tag auth-fix                     # tag the current session
+clexo tag                              # show current session's tag (auto-create if none)
+clexo tag auth-fix                     # tag the current session with a chosen name
 clexo tag auth-fix <session-uuid>      # tag a specific session
 clexo tag auth-fix --force             # replace an existing tag
 
@@ -18,6 +19,32 @@ clexo pick "csrf token" \              # drill into a tagged session
 
 Tag names: `[a-z0-9_-]`, lowercase. Anything that looks like a UUID is rejected (to keep
 tag-or-uuid resolution unambiguous).
+
+## Auto-tags
+
+The first time you `clexo save` an untagged session, clexo generates a tag from the
+session's title (Claude's AI-set thread name) or first user message, prefixed with the
+project directory name. Example:
+
+```
+$ clexo save
+Wrote snapshot: 14,961 chars ≈ 3.7K tokens
+Compacted from ~205K msg tokens (98% smaller)
+Tagged 'clexo-improve-gain'
+Run /clear — snapshot auto-restores on next message.
+```
+
+The same logic powers bare `clexo tag` — running it on an untagged session creates the
+auto-tag; on an already-tagged session, it just prints the existing tag plus the two
+commands to act on it (`clexo resume <tag>` or `clexo load <tag>`).
+
+Stop words (`how`, `what`, `please`, articles, pronouns, …) are stripped; the first
+three content words are joined into the topic; the project prefix is dropped if it
+already appears as a topic word. On name collisions a numeric suffix is appended
+(`-2`, `-3`, …) until a free slot is found.
+
+Auto-tags are indistinguishable from manual tags once created — same table, same
+commands. Rename or remove them like any other tag.
 
 ## How `load <name>` resolves
 
