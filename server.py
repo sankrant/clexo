@@ -2438,6 +2438,116 @@ def _print_stats() -> None:
         sys.exit(1)
 
 
+def _relative_when(ts: str) -> str:
+    """Render an ISO timestamp as 'today HH:MM', 'yesterday', 'N days ago',
+    or 'YYYY-MM-DD' for older entries. Returns '?' on parse failure."""
+    if not ts:
+        return "?"
+    try:
+        when = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return ts[:10] or "?"
+    now = datetime.datetime.now(when.tzinfo) if when.tzinfo else datetime.datetime.now()
+    delta = now - when
+    if delta.days == 0 and when.date() == now.date():
+        return f"today {when.strftime('%H:%M')}"
+    if delta.days < 2 and (now.date() - when.date()).days == 1:
+        return "yesterday"
+    if 2 <= delta.days < 7:
+        return f"{delta.days}d ago"
+    return when.strftime("%Y-%m-%d")
+
+
+def _pick_short_label(thread_name: str, first_user_msg: str, max_chars: int = 50) -> str:
+    """Pick the most informative one-line label for a session row."""
+    for cand in (thread_name, first_user_msg):
+        s = (cand or "").strip().replace("\n", " ")
+        if s and not _is_noise(s):
+            return s[:max_chars] + ("…" if len(s) > max_chars else "")
+    return "(no title)"
+
+
+def _resume_picker() -> None:
+    """Interactive picker invoked by bare `clexo resume`.
+
+    Lists the 20 most-recently-active sessions and prompts the user to pick
+    one. Selection format: `N` (default mode = full resume) or `N r` / `N s`
+    where r = resume full session (execs `claude --resume <uuid>`) and
+    s = load snapshot (same flow as `clexo load`). `q` or empty quits.
+    """
+    if not sys.stdout.isatty():
+        print("clexo resume (no args) requires an interactive terminal.", file=sys.stderr)
+        sys.exit(1)
+
+    db = get_db()
+    rows = db.execute("""
+        SELECT s.session_id, s.last_ts, s.project, s.cwd,
+               s.thread_name, s.first_user_msg, s.source,
+               (SELECT GROUP_CONCAT(tag, ',') FROM tags
+                WHERE session_id = s.session_id) AS tag_list
+        FROM sessions s
+        WHERE s.last_ts IS NOT NULL AND s.last_ts != ''
+        ORDER BY s.last_ts DESC
+        LIMIT 20
+    """).fetchall()
+    if not rows:
+        print("No sessions in the index. Run `clexo sync` first.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Recent sessions — pick one to resume:")
+    print()
+    items = []
+    for i, (sid, ts, project, cwd, thread_name, first_user_msg, source, tag_list) in enumerate(rows, 1):
+        proj = _project_slug(project or "", cwd or "") or (project or "?")
+        when = _relative_when(ts)
+        tag  = (tag_list.split(",")[0] if tag_list else "")
+        ident = tag if tag else f"{sid[:8]}…"
+        label = _pick_short_label(thread_name, first_user_msg)
+        src_marker = "" if source in (None, "", "claude") else f"[{source}]"
+        print(f"  {i:>2}. {ident:<26} {when:<14} {proj:<14} {src_marker:<8} · {label}")
+        items.append((sid, source or "claude"))
+    print()
+    print("Mode: [r] resume full session  [s] load snapshot  [q] quit")
+    try:
+        raw = input("> ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not raw or raw == "q":
+        return
+
+    parts = raw.replace(",", " ").split()
+    try:
+        n = int(parts[0])
+    except (ValueError, IndexError):
+        print(f"Invalid selection: {raw!r}", file=sys.stderr)
+        sys.exit(1)
+    if not (1 <= n <= len(items)):
+        print(f"Selection out of range (1–{len(items)}).", file=sys.stderr)
+        sys.exit(1)
+    mode = (parts[1] if len(parts) > 1 else "r")[0]
+    if mode not in ("r", "s"):
+        print(f"Unknown mode {mode!r} (expected r or s).", file=sys.stderr)
+        sys.exit(1)
+
+    sid, source = items[n - 1]
+    if mode == "r":
+        if source == "codex":
+            print(_resume_cmd("codex", sid))
+            return
+        os.execvp("claude", ["claude", "--resume", sid])
+    else:
+        chain_f   = CLEXO_DIR / f"chain-{sid}.md"
+        refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
+        if not chain_f.exists() and not refresh_f.exists():
+            result = refresh_save(sid)
+            if result.startswith("No session JSONL"):
+                print(result, file=sys.stderr)
+                sys.exit(1)
+        REFRESH_PENDING.write_text(sid)
+        os.execvp("claude", ["claude"])
+
+
 if __name__ == "__main__":
     if "--sync" in sys.argv:
         n = sync_all()
@@ -2552,8 +2662,9 @@ if __name__ == "__main__":
     elif "--resume" in sys.argv:
         idx = sys.argv.index("--resume")
         if idx + 1 >= len(sys.argv):
-            print("Usage: server.py --resume <tag-or-uuid>", file=sys.stderr)
-            sys.exit(1)
+            # No arg → interactive picker (resume full / load snapshot).
+            _resume_picker()
+            sys.exit(0)
         name = sys.argv[idx + 1]
         sid = _resolve_session_or_tag(name)
         if not _TAG_UUID_RE.match(sid.lower()):

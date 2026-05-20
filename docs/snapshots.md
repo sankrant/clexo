@@ -52,6 +52,35 @@ line only appears the first time a session is saved — subsequent saves on the 
 session reuse its existing tag rather than creating new ones. See
 [tags.md](tags.md#auto-tags) for the naming rules.
 
+## Picking a session to restore
+
+When you don't remember a tag or UUID, run `clexo resume` with no argument.
+Symmetric with `claude --resume` (which also shows a picker when invoked
+without an id), but with clexo's index of tags, timestamps, and project
+context — plus an option to load via snapshot instead of full resume:
+
+```
+$ clexo resume
+Recent sessions — pick one to resume:
+
+   1. improve-clexo-gain         today 16:11    clexo                   · Improve clexo gain function
+   2. coach                      yesterday      Code                    · Coaching session setup
+   3. 3323483d…                  3d ago         Webapp                 · fix auth bug in checkout
+   …
+
+Mode: [r] resume full session  [s] load snapshot  [q] quit
+> 1 s
+```
+
+Selection format is `N` (defaults to `r` = full session) or `N r` / `N s` for an
+explicit mode. `r` execs `claude --resume <uuid>` — reopens the original session
+with full history. `s` writes the snapshot to `REFRESH_PENDING` and execs a fresh
+`claude` so the SessionStart hook injects the snapshot — same path as `clexo
+load`. `q` or empty input quits without doing anything.
+
+Codex rows are marked `[codex]`; selecting one in `r` mode prints the
+`codex resume` command instead of execing claude.
+
 ## The fast path: `!clexo save`
 
 Inside a Claude Code session, `!` is the bash escape — it runs a shell command directly,

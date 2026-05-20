@@ -145,6 +145,8 @@ clexo load <name|sid>                Set pending snapshot and launch a fresh cla
                                      (SessionStart hook injects the snapshot)
 clexo resume <name|sid>              Exec 'claude --resume <uuid>' — reopens the
                                      original session, full history (no snapshot)
+clexo resume                         (no args) Interactive picker over recent
+                                     sessions; choose resume / load mode
 clexo show <name|sid>                Print the saved snapshot to stdout (inspect only)
 
 clexo install-hooks                  Wire SessionStart + SessionEnd hooks into
