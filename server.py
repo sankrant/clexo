@@ -87,6 +87,10 @@ def get_db() -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT DEFAULT {dflt}")
     if "prefix_delta_tokens" not in existing:
         conn.execute("ALTER TABLE sessions ADD COLUMN prefix_delta_tokens INTEGER DEFAULT 0")
+    if "prefix_delta_input_tokens" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN prefix_delta_input_tokens INTEGER DEFAULT 0")
+    if "prefix_delta_cache_tokens" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN prefix_delta_cache_tokens INTEGER DEFAULT 0")
     # One-shot: split historical tokens_saved (compaction-only) into tokens_compacted.
     done = conn.execute("SELECT 1 FROM stats WHERE key='migration_split_tokens'").fetchone()
     if not done:
@@ -97,6 +101,17 @@ def get_db() -> sqlite3.Connection:
         """)
         conn.execute("DELETE FROM stats WHERE key='tokens_saved'")
         conn.execute("INSERT OR IGNORE INTO stats(key, value) VALUES('migration_split_tokens', 1)")
+    # One-shot: zero out bogus byte/4 deltas; switch to usage-based input/cache split.
+    done2 = conn.execute("SELECT 1 FROM stats WHERE key='migration_split_input_cache'").fetchone()
+    if not done2:
+        conn.execute("UPDATE sessions SET prefix_delta_tokens = 0 WHERE prefix_delta_tokens > 0")
+        conn.execute("DELETE FROM stats WHERE key='tokens_saved'")
+        conn.execute("INSERT OR IGNORE INTO stats(key, value) VALUES('migration_split_input_cache', 1)")
+    # One-shot: zero tokens_compacted — accumulated with the same broken byte/4 formula.
+    done3 = conn.execute("SELECT 1 FROM stats WHERE key='migration_reset_compacted'").fetchone()
+    if not done3:
+        conn.execute("DELETE FROM stats WHERE key='tokens_compacted'")
+        conn.execute("INSERT OR IGNORE INTO stats(key, value) VALUES('migration_reset_compacted', 1)")
     conn.commit()
     return conn
 
@@ -121,6 +136,45 @@ def _extract_claude_text(content) -> str:
                 parts.append(f"[{name}] {vals}")
         return " ".join(parts)
     return ""
+
+
+# ── source-session prefix accounting ──────────────────────────────────────────
+
+def _claude_source_prefix(jsonl_path) -> tuple[int, int]:
+    """Return (input_tokens, cache_tokens) from the last assistant message's
+    `usage` block in a Claude Code JSONL. This is the real API prefix the
+    source session would have replayed on its next turn — the value a clexo
+    snapshot eliminates by replacing the conversation with a small blob.
+
+    cache_tokens = cache_read_input_tokens + cache_creation_input_tokens.
+    Returns (0, 0) if the file is missing, unreadable, or has no assistant
+    usage blocks (e.g. a Codex JSONL or an empty session)."""
+    if not jsonl_path or not jsonl_path.exists():
+        return 0, 0
+    last_input = 0
+    last_cache = 0
+    try:
+        with open(jsonl_path, "rb") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                u = (obj.get("message") or {}).get("usage") or {}
+                ipt   = int(u.get("input_tokens")               or 0)
+                cread = int(u.get("cache_read_input_tokens")    or 0)
+                cwrt  = int(u.get("cache_creation_input_tokens") or 0)
+                if (ipt + cread + cwrt) > 0:
+                    last_input = ipt
+                    last_cache = cread + cwrt
+    except Exception:
+        return 0, 0
+    return last_input, last_cache
 
 
 # ── incremental line reader ───────────────────────────────────────────────────
@@ -158,10 +212,12 @@ def _sync_claude(conn) -> int:
             new_offset = last_offset
 
             delta_row = conn.execute(
-                "SELECT prefix_delta_tokens FROM sessions WHERE session_id = ?",
+                "SELECT prefix_delta_input_tokens, prefix_delta_cache_tokens "
+                "FROM sessions WHERE session_id = ?",
                 [session_id],
             ).fetchone()
-            prefix_delta = (delta_row[0] if delta_row else 0) or 0
+            prefix_input = (delta_row[0] if delta_row else 0) or 0
+            prefix_cache = (delta_row[1] if delta_row else 0) or 0
             assistant_turns_this_pass = 0
 
             for raw_line, new_offset in _read_new_lines(jsonl_file, last_offset):
@@ -224,11 +280,17 @@ def _sync_claude(conn) -> int:
 
             conn.execute("INSERT OR REPLACE INTO file_state VALUES(?,?)", [fp, new_offset])
 
-            if prefix_delta > 0 and assistant_turns_this_pass > 0:
-                conn.execute("""
-                    INSERT INTO stats(key, value) VALUES('tokens_saved', ?)
-                    ON CONFLICT(key) DO UPDATE SET value = value + excluded.value
-                """, [prefix_delta * assistant_turns_this_pass])
+            if assistant_turns_this_pass > 0:
+                if prefix_input > 0:
+                    conn.execute("""
+                        INSERT INTO stats(key, value) VALUES('input_tokens_saved', ?)
+                        ON CONFLICT(key) DO UPDATE SET value = value + excluded.value
+                    """, [prefix_input * assistant_turns_this_pass])
+                if prefix_cache > 0:
+                    conn.execute("""
+                        INSERT INTO stats(key, value) VALUES('cache_tokens_saved', ?)
+                        ON CONFLICT(key) DO UPDATE SET value = value + excluded.value
+                    """, [prefix_cache * assistant_turns_this_pass])
         except Exception as e:
             if _debug_enabled():
                 print(f"[clexo sync claude] {jsonl_file}: {e}", file=sys.stderr)
@@ -1437,9 +1499,7 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
                     role     = msg.get('role', obj['type'])
                     raw      = msg.get('content', '')
                     text     = _extract_content(raw, include_results=False)
-                    text_all = _extract_content(raw, include_results=True)
                     if text and not _is_system_noise(text):
-                        full_chars += len(text_all)
                         msgs.append((role, text, ts))
             except Exception:
                 continue
@@ -1468,16 +1528,6 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
         if total >= chars_min:
             break
     selected.reverse()
-
-    tokens_compacted = max(0, (full_chars - total) // 4)
-    try:
-        db.execute("""
-            INSERT INTO stats(key, value) VALUES('tokens_compacted', ?)
-            ON CONFLICT(key) DO UPDATE SET value = value + excluded.value
-        """, [tokens_compacted])
-        db.commit()
-    except Exception:
-        pass
 
     exchanges = []
     for u, a in selected:
@@ -1525,7 +1575,26 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
 
     total_chars = len(prior_content) + len(new_section)
     snap_tok = total_chars // 4
-    src_tok  = full_chars // 4
+
+    # Real prefix size of the source session at save time. For Claude we read
+    # the last assistant turn's `usage` (input + cache_read + cache_creation)
+    # — that's the API prefix this snapshot eliminates. For Codex (no usage
+    # data) fall back to extracted-text bytes.
+    if source == 'claude':
+        src_input, src_cache = _claude_source_prefix(jsonl)
+        src_tok = src_input + src_cache
+    else:
+        src_tok = full_chars // 4
+
+    tokens_compacted = max(0, src_tok - snap_tok)
+    try:
+        db.execute("""
+            INSERT INTO stats(key, value) VALUES('tokens_compacted', ?)
+            ON CONFLICT(key) DO UPDATE SET value = value + excluded.value
+        """, [tokens_compacted])
+        db.commit()
+    except Exception:
+        pass
 
     try:
         auto_tag = _apply_auto_tag(session_id, db)
@@ -1535,7 +1604,7 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
     lines = [f"Wrote snapshot: {total_chars:,} chars ≈ {_human_count(snap_tok)} tokens"]
     if src_tok > snap_tok and src_tok > 0:
         pct = round((1 - snap_tok / src_tok) * 100)
-        lines.append(f"Compacted from ~{_human_count(src_tok)} msg tokens ({pct}% smaller)")
+        lines.append(f"Compacted from ~{_human_count(src_tok)} prefix tokens ({pct}% smaller)")
     if auto_tag:
         lines.append(f"Tagged '{auto_tag}'")
     lines.append("Run /clear — snapshot auto-restores on next message.")
@@ -2153,15 +2222,23 @@ def _session_start_hook() -> None:
     if loaded_sid:
         _CHAIN_LOADED.write_text(loaded_sid)
 
-    # Stamp the new session with the per-turn prefix delta for this load:
-    # (full original JSONL bytes − snapshot bytes) / 4. Each subsequent
-    # assistant turn in this new session will credit `delta` to tokens_saved
-    # during sync, capturing the compounding prefix-replay savings.
+    # Stamp the new session with the per-turn prefix delta for this load.
+    # The "delta" is the size of the API prefix that the source session
+    # would have replayed on its next turn — derived from the last assistant
+    # message's `usage` block (Claude Code's own accounting), split into
+    # fresh input_tokens vs cache (read + creation). Each subsequent
+    # assistant turn in this new session credits both into stats.
+    prefix_delta_input = 0
+    prefix_delta_cache = 0
+    snapshot_tok = 0
+    if loaded_sid:
+        chain_f   = CLEXO_DIR / f"chain-{loaded_sid}.md"
+        refresh_f = CLEXO_DIR / f"refresh-{loaded_sid}.md"
+        snapshot_path = chain_f if chain_f.exists() else (refresh_f if refresh_f.exists() else None)
+        if snapshot_path:
+            snapshot_tok = snapshot_path.stat().st_size // 4
     if new_sid and loaded_sid and new_sid != loaded_sid:
         try:
-            chain_f   = CLEXO_DIR / f"chain-{loaded_sid}.md"
-            refresh_f = CLEXO_DIR / f"refresh-{loaded_sid}.md"
-            snapshot_path = chain_f if chain_f.exists() else (refresh_f if refresh_f.exists() else None)
             conn = get_db()
             src_row = conn.execute(
                 "SELECT COALESCE(source,'claude') FROM sessions WHERE session_id = ?",
@@ -2169,17 +2246,27 @@ def _session_start_hook() -> None:
             ).fetchone()
             src = (src_row[0] if src_row else "claude") or "claude"
             jsonl_path = _find_session_jsonl(loaded_sid, source=src)
-            if snapshot_path and jsonl_path:
-                delta = max(0, (jsonl_path.stat().st_size - snapshot_path.stat().st_size) // 4)
-                if delta > 0:
+            if jsonl_path and src == "claude":
+                src_input, src_cache = _claude_source_prefix(jsonl_path)
+                prefix_delta_input = max(0, src_input)
+                prefix_delta_cache = max(0, src_cache)
+                total = prefix_delta_input + prefix_delta_cache
+                if total > 0:
                     conn.execute("""
-                        INSERT INTO sessions(session_id, prefix_delta_tokens)
-                        VALUES(?, ?)
-                        ON CONFLICT(session_id) DO UPDATE SET prefix_delta_tokens = excluded.prefix_delta_tokens
-                    """, [new_sid, delta])
+                        INSERT INTO sessions(session_id,
+                                             prefix_delta_tokens,
+                                             prefix_delta_input_tokens,
+                                             prefix_delta_cache_tokens)
+                        VALUES(?, ?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            prefix_delta_tokens       = excluded.prefix_delta_tokens,
+                            prefix_delta_input_tokens = excluded.prefix_delta_input_tokens,
+                            prefix_delta_cache_tokens = excluded.prefix_delta_cache_tokens
+                    """, [new_sid, total, prefix_delta_input, prefix_delta_cache])
                     conn.commit()
         except Exception:
             pass
+    prefix_delta = prefix_delta_input + prefix_delta_cache
 
     lines = content.splitlines()
 
@@ -2235,7 +2322,10 @@ def _session_start_hook() -> None:
     def _human_bytes(n: int) -> str:
         return f"{n/1024:.1f}K" if n >= 1024 else f"{n}B"
 
-    stats = f"ctx {_human_bytes(len(compact))}/{_human_bytes(CAP)}"
+    if prefix_delta > 0 and snapshot_tok > 0:
+        stats = f"{_human_count(snapshot_tok)}/{_human_count(prefix_delta)} tokens/turn saved"
+    else:
+        stats = f"ctx {_human_bytes(len(compact))}/{_human_bytes(CAP)}"
     if total_n:
         stats += f" · {kept_n}/{total_n} turns"
         if elided > 0:
@@ -2393,13 +2483,13 @@ def _format_stats() -> str:
     ).fetchall())
     tag_count = db.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
 
-    messages  = rows.get("messages_indexed", 0)
-    saves     = rows.get("refresh_saves",    0)
-    loads     = rows.get("refresh_loads",    0)
-    compacted = rows.get("tokens_compacted", 0)
-    saved     = rows.get("tokens_saved",     0)
-    picks     = rows.get("pick_uses",        0)
-    searches  = rows.get("search_calls",     0)
+    messages  = rows.get("messages_indexed",   0)
+    saves     = rows.get("refresh_saves",      0)
+    loads     = rows.get("refresh_loads",      0)
+    compacted = rows.get("tokens_compacted",   0)
+    cache_saved = rows.get("cache_tokens_saved", 0)
+    picks     = rows.get("pick_uses",          0)
+    searches  = rows.get("search_calls",       0)
 
     src_bits = []
     if by_source.get("claude"):
@@ -2408,17 +2498,31 @@ def _format_stats() -> str:
         src_bits.append(f"codex {by_source['codex']:,}")
     src_suffix = f"  ({' · '.join(src_bits)})" if src_bits else ""
 
-    ctx_equiv = saved / 200_000
-    ctx_suffix = f"  (≈ {ctx_equiv:.0f}× 200k ctx)" if ctx_equiv >= 1 else ""
+    breakdown_row = db.execute(
+        "SELECT COUNT(*), SUM(prefix_delta_cache_tokens) "
+        "FROM sessions WHERE prefix_delta_cache_tokens > 0"
+    ).fetchone()
+    n_loads = breakdown_row[0] or 0
+    sum_cache = breakdown_row[1] or 0
+
+    def _cache_suffix() -> str:
+        if cache_saved <= 0 or n_loads <= 0 or sum_cache <= 0:
+            return ""
+        avg_delta = round(sum_cache / n_loads)
+        avg_turns = round(cache_saved / sum_cache)
+        return (
+            f"  ({n_loads} loads × ~{avg_turns} turns × "
+            f"~{_human_count(avg_delta)} tokens/turn)"
+        )
 
     rule = "─" * 40
     lines = [
         "clexo gain — Global",
         rule,
-        f"Sessions indexed:   {sessions:>6,}{src_suffix}",
-        f"Messages indexed:   {messages:>6,}",
-        f"Tokens compacted:   {_human_count(compacted):>6}  (one-shot at save time)",
-        f"Tokens saved:       {_human_count(saved):>6}{ctx_suffix}  (per-turn in loaded sessions)",
+        f"Sessions indexed:    {sessions:>6,}{src_suffix}",
+        f"Messages indexed:    {messages:>6,}",
+        f"Tokens compacted:    {_human_count(compacted):>6}  (one-shot at save time)",
+        f"Cache tokens saved:  {_human_count(cache_saved):>6}{_cache_suffix()}",
         "",
         "Activity",
         f"  Saves     {saves:>5,}",
