@@ -2571,6 +2571,95 @@ def _pick_short_label(thread_name: str, first_user_msg: str, max_chars: int = 50
     return "(no title)"
 
 
+def _search_picker(query: str) -> None:
+    """Interactive picker invoked by `clexo load <non-uuid-string>`.
+
+    Searches sessions by FTS query and lets the user pick one to load as a
+    snapshot (s, default) or resume fully (r). Exits after acting.
+    """
+    if not sys.stdout.isatty():
+        print(f"No session matched '{query}' as a tag or UUID. "
+              "Run `clexo search <query>` to find sessions.", file=sys.stderr)
+        sys.exit(1)
+
+    db = get_db()
+    sync_all(db, throttle=True)
+
+    fts_query = f'"{query}"' if '"' not in query else query
+    try:
+        rows = db.execute("""
+            SELECT DISTINCT s.session_id, s.last_ts, s.project, s.cwd,
+                   s.thread_name, s.first_user_msg, s.source,
+                   (SELECT GROUP_CONCAT(tag, ',') FROM tags
+                    WHERE session_id = s.session_id) AS tag_list
+            FROM messages m
+            JOIN sessions s ON s.session_id = m.session_id
+            WHERE messages MATCH ?
+            ORDER BY rank
+            LIMIT 20
+        """, [fts_query]).fetchall()
+    except Exception:
+        rows = []
+
+    if not rows:
+        print(f"No sessions found matching '{query}'. "
+              "Try `clexo search <query>` for more options.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Sessions matching '{query}' — pick one:")
+    print()
+    items = []
+    for i, (sid, ts, project, cwd, thread_name, first_user_msg, source, tag_list) in enumerate(rows, 1):
+        proj = _project_slug(project or "", cwd or "") or (project or "?")
+        when = _relative_when(ts)
+        tag  = (tag_list.split(",")[0] if tag_list else "")
+        ident = tag if tag else f"{sid[:8]}…"
+        label = _pick_short_label(thread_name, first_user_msg)
+        src_marker = "" if source in (None, "", "claude") else f"[{source}]"
+        print(f"  {i:>2}. {ident:<26} {when:<14} {proj:<14} {src_marker:<8} · {label}")
+        items.append((sid, source or "claude"))
+    print()
+    print("Mode: [s] load snapshot (default)  [r] resume full session  [q] quit")
+    try:
+        raw = input("> ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not raw or raw == "q":
+        return
+
+    parts = raw.replace(",", " ").split()
+    try:
+        n = int(parts[0])
+    except (ValueError, IndexError):
+        print(f"Invalid selection: {raw!r}", file=sys.stderr)
+        sys.exit(1)
+    if not (1 <= n <= len(items)):
+        print(f"Selection out of range (1–{len(items)}).", file=sys.stderr)
+        sys.exit(1)
+    mode = (parts[1] if len(parts) > 1 else "s")[0]
+    if mode not in ("r", "s"):
+        print(f"Unknown mode {mode!r} (expected r or s).", file=sys.stderr)
+        sys.exit(1)
+
+    sid, source = items[n - 1]
+    if mode == "r":
+        if source == "codex":
+            print(_resume_cmd("codex", sid))
+            return
+        os.execvp("claude", ["claude", "--resume", sid])
+    else:
+        chain_f   = CLEXO_DIR / f"chain-{sid}.md"
+        refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
+        if not chain_f.exists() and not refresh_f.exists():
+            result = refresh_save(sid)
+            if result.startswith("No session JSONL"):
+                print(result, file=sys.stderr)
+                sys.exit(1)
+        REFRESH_PENDING.write_text(sid)
+        os.execvp("claude", ["claude"])
+
+
 def _resume_picker() -> None:
     """Interactive picker invoked by bare `clexo resume`.
 
@@ -2744,11 +2833,9 @@ if __name__ == "__main__":
             sys.exit(1)
         sid = _resolve_session_or_tag(arg)
         if not _TAG_UUID_RE.match(sid.lower()):
-            print(f"'{arg}' is not a complete UUID (need 36 chars, "
-                  f"8-4-4-4-12) and not a known tag. "
-                  f"Run `clexo tags` to list, or check that the sid wasn't truncated.",
-                  file=sys.stderr)
-            sys.exit(1)
+            # Not a UUID or known tag — treat as a search query and show picker.
+            _search_picker(arg)
+            sys.exit(0)
         chain_f   = CLEXO_DIR / f"chain-{sid}.md"
         refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
         if not chain_f.exists() and not refresh_f.exists():
