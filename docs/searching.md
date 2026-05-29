@@ -44,7 +44,15 @@ clexo search "deploy" --project_filter this
 # Restrict to one AI
 clexo search "deploy" --source_filter claude
 clexo search "deploy" --source_filter codex
+
+# Cap the number of results
+clexo search "deploy" --limit 3
 ```
+
+Flags can appear anywhere in the command — they're pulled out before the rest is
+joined into the FTS query, so `clexo search nginx config --source_filter codex`
+searches for `nginx config` in Codex sessions. `--source`/`--project` are accepted
+as shorthands, and `--flag=value` works too.
 
 The MCP tool accepts the same parameters: `search(query="...", project_filter="webapp",
 source_filter="claude")`.
@@ -59,11 +67,19 @@ source_filter="claude")`.
     Last: shipped to staging, verified — closing
     Match: [assistant] [Bash] curl -X POST ... → 403 forbidden (>>>csrf<<< token missing)
     Session: 8f3a72b1-cd54-...
-    Resume: claude --resume 8f3a72b1-cd54-...
+    Resume: clexo resume 8f3a72b1-cd54-...   (full session · claude --resume)
+    Load:   clexo load 8f3a72b1-cd54-...   (compacted snapshot)
 ```
 
-Each result shows opening/closing lines, one match snippet, and the resume command. If
-the summary isn't enough, `pick` drills into the same session for raw context.
+Each result shows opening/closing lines, one match snippet, and two ways back into the
+session — both routed through `clexo` so you needn't remember the underlying CLI:
+
+- `clexo resume <id>` reopens the full session. The parenthetical shows the source-specific
+  command it dispatches to: `claude --resume` for Claude, `grok --resume` for Grok,
+  `codex resume` for Codex.
+- `clexo load <id>` injects a compacted snapshot into a fresh session instead.
+
+If the summary isn't enough, `pick` drills into the same session for raw context.
 
 ## Empty query — list recent sessions
 

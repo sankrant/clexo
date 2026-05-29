@@ -623,11 +623,32 @@ def _resume_binary(source: str) -> str:
     return "claude"
 
 
-def _resume_cmd(source: str, session_id: str) -> str:
+def _resume_argv(source: str, session_id: str) -> list[str]:
+    """argv that fully resumes a session, dispatched by source.
+
+    codex uses a positional subcommand (`codex resume <id>`); claude and grok
+    take the id behind a `--resume` flag."""
     if source == "codex":
-        return ""   # codex resume only works as a terminal command; not actionable in-session
+        return ["codex", "resume", session_id]
     binary = _resume_binary(source)
-    return f"{binary} --resume {session_id}"
+    return [binary, "--resume", session_id]
+
+
+def _resume_cmd(source: str, session_id: str) -> str:
+    """Paste-ready full-resume command for a session, correct for its source."""
+    return " ".join(_resume_argv(source, session_id))
+
+
+def _resume_footer(source: str, session_id: str, indent: str = "    ") -> list[str]:
+    """The two-line 'how to get back in' footer shown under a search result:
+    a full-resume via clexo (annotated with the source's own command) and a
+    compacted-snapshot load. Both route through clexo so the user needn't
+    remember the underlying CLI."""
+    underlying = " ".join(_resume_argv(source, session_id)[:-1])
+    return [
+        f"{indent}Resume: clexo resume {session_id}   (full session · {underlying})",
+        f"{indent}Load:   clexo load {session_id}   (compacted snapshot)",
+    ]
 
 
 # Single source of truth for prefixes that mark system-injected (non-user) text.
@@ -1490,11 +1511,97 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
         for snip in info["snippets"][:2]:
             out.append(f"    Match: {snip}")
         out.append(f"    Session: {sid}")
-        resume = _resume_cmd(info['source'], sid)
-        if resume:
-            out.append(f"    Resume: {resume}")
+        out.extend(_resume_footer(info["source"], sid))
         out.append("")
     return "\n".join(out)
+
+
+def _list_recent_sessions(limit: int = 10, project_filter: str = "",
+                          source_filter: str = "") -> str:
+    """List recent sessions newest-first, optionally narrowed by project/source.
+    Used when search is called with an empty query."""
+    db = get_db()
+    sync_all(db, throttle=True)
+    conditions: list[str] = []
+    params: list = []
+    if project_filter:
+        conditions.append("project LIKE ?")
+        params.append(f"%{project_filter}%")
+    if source_filter:
+        conditions.append("source = ?")
+        params.append(source_filter)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = db.execute(f"""
+        SELECT session_id, project, first_user_msg, last_ts, source, thread_name
+        FROM sessions {where}
+        ORDER BY last_ts DESC LIMIT ?
+    """, params + [limit]).fetchall()
+    if not rows:
+        return "No sessions indexed yet."
+    out = [f"Recent {len(rows)} session(s):\n"]
+    for sid, project, first_msg, ts, src, thread_name in rows:
+        date = ts[:10] if ts else "?"
+        proj = project.lstrip("-").replace("-", "/")
+        src  = src or "claude"
+        out.append(f"{date} [{src}] | {proj}")
+        if src == "codex" and thread_name:
+            out.append(f"  Title: {thread_name}")
+        for j, line in enumerate(_session_summary(db, sid)):
+            out.append(f"  {'Opening:' if j == 0 else 'Last:'} {line}")
+        out.append(f"  Session: {sid}")
+        out.extend(_resume_footer(src, sid, indent="  "))
+        out.append("")
+    return "\n".join(out)
+
+
+def search_sessions(query: str = "", limit: int = 10, project_filter: str = "",
+                    source_filter: str = "") -> str:
+    """Full-text search across the archive, or list recent sessions when the
+    query is empty. Resolves "this"/"cwd"/"." project aliases. Shared entry
+    point for the MCP `search` tool and the `clexo search` CLI."""
+    pf = _resolve_project_filter(project_filter)
+    if not query.strip():
+        return _list_recent_sessions(limit, pf, source_filter)
+    return _search(query, limit=limit, project_filter=pf, source_filter=source_filter)
+
+
+# Flags the `clexo search` CLI understands; each takes a value. The rest of the
+# argv is joined into the FTS query. Both `--flag value` and `--flag=value` work.
+_SEARCH_FLAGS = {
+    "--source_filter":  "source_filter",
+    "--source":         "source_filter",
+    "--project_filter": "project_filter",
+    "--project":        "project_filter",
+    "--limit":          "limit",
+}
+
+def _parse_search_args(args: list[str]) -> tuple[str, dict]:
+    """Split `clexo search` argv into (query, opts), pulling out --flags so they
+    aren't swallowed into the FTS query."""
+    opts = {"source_filter": "", "project_filter": "", "limit": 10}
+    query: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        key = val = None
+        if a.split("=", 1)[0] in _SEARCH_FLAGS and "=" in a:
+            name, val = a.split("=", 1)
+            key = _SEARCH_FLAGS[name]
+        elif a in _SEARCH_FLAGS:
+            key = _SEARCH_FLAGS[a]
+            val = args[i + 1] if i + 1 < len(args) else ""
+            i += 1
+        else:
+            query.append(a)
+        if key == "limit":
+            try:
+                opts["limit"] = int(val)
+            except (TypeError, ValueError):
+                pass
+        elif key:
+            opts[key] = val
+        i += 1
+    return " ".join(query), opts
 
 
 def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> str:
@@ -1776,41 +1883,8 @@ def _run_server():
             source_filter: "claude", "codex", or "grok" to restrict to sessions from one AI.
                            Use source_filter="grok" to search only Grok Build history.
         """
-        pf = _resolve_project_filter(project_filter)
-        if not query.strip():
-            sync_all(db, throttle=True)
-            conditions, params = [], []
-            if pf:
-                conditions.append("project LIKE ?")
-                params.append(f"%{pf}%")
-            if source_filter:
-                conditions.append("source = ?")
-                params.append(source_filter)
-            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-            rows = db.execute(f"""
-                SELECT session_id, project, first_user_msg, last_ts, source, thread_name
-                FROM sessions {where}
-                ORDER BY last_ts DESC LIMIT ?
-            """, params + [limit]).fetchall()
-            if not rows:
-                return "No sessions indexed yet."
-            out = [f"Recent {len(rows)} session(s):\n"]
-            for sid, project, first_msg, ts, src, thread_name in rows:
-                date = ts[:10] if ts else "?"
-                proj = project.lstrip("-").replace("-", "/")
-                src  = src or "claude"
-                out.append(f"{date} [{src}] | {proj}")
-                if src == "codex" and thread_name:
-                    out.append(f"  Title: {thread_name}")
-                for j, line in enumerate(_session_summary(db, sid)):
-                    out.append(f"  {'Opening:' if j == 0 else 'Last:'} {line}")
-                out.append(f"  Session: {sid}")
-                resume = _resume_cmd(src, sid)
-                if resume:
-                    out.append(f"  Resume: {resume}")
-                out.append("")
-            return "\n".join(out)
-        return _search(query, limit=limit, project_filter=pf, source_filter=source_filter)
+        return search_sessions(query, limit=limit, project_filter=project_filter,
+                                source_filter=source_filter)
 
     @app.tool()
     def grok_search(query: str = "", limit: int = 10, project_filter: str = "") -> str:
@@ -1828,7 +1902,8 @@ def _run_server():
         Returns ranked Grok sessions with snippets.
         Then use load(session_id) or pick() for more details.
         """
-        return _search(query, limit=limit, project_filter=project_filter, source_filter="grok")
+        return search_sessions(query, limit=limit, project_filter=project_filter,
+                                source_filter="grok")
 
     def get_session_excerpt(
         session_id: str,
@@ -2764,11 +2839,8 @@ def _search_picker(query: str) -> None:
 
     sid, source = items[n - 1]
     if mode == "r":
-        if source == "codex":
-            print(_resume_cmd("codex", sid))
-            return
-        binary = _resume_binary(source or "claude")
-        os.execvp(binary, [binary, "--resume", sid])
+        argv = _resume_argv(source or "claude", sid)
+        os.execvp(argv[0], argv)
     else:
         chain_f   = CLEXO_DIR / f"chain-{sid}.md"
         refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
@@ -2847,11 +2919,8 @@ def _resume_picker() -> None:
 
     sid, source = items[n - 1]
     if mode == "r":
-        if source == "codex":
-            print(_resume_cmd("codex", sid))
-            return
-        binary = _resume_binary(source or "claude")
-        os.execvp(binary, [binary, "--resume", sid])
+        argv = _resume_argv(source or "claude", sid)
+        os.execvp(argv[0], argv)
     else:
         chain_f   = CLEXO_DIR / f"chain-{sid}.md"
         refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
@@ -2871,15 +2940,17 @@ if __name__ == "__main__":
         print(f"Indexed {n} new messages.", flush=True)
     elif "--session-start" in sys.argv:
         _session_start_hook()
-    elif "--stats" in sys.argv or "stats" in sys.argv or "gain" in sys.argv:
+    elif "--stats" in sys.argv or (len(sys.argv) > 1 and sys.argv[1] in ("stats", "gain")):
+        # Match the bare command words only in the command position — otherwise a
+        # search query like `clexo search clexo gain` would route to stats.
         _print_stats()
     elif "--search" in sys.argv:
         idx = sys.argv.index("--search")
-        query = " ".join(sys.argv[idx + 1:]) if idx + 1 < len(sys.argv) else ""
-        if not query:
-            print("Usage: server.py --search <query>", file=sys.stderr)
-            sys.exit(1)
-        print(_search(query))
+        query, opts = _parse_search_args(sys.argv[idx + 1:])
+        # Empty query is valid — lists recent sessions (optionally filtered).
+        print(search_sessions(query, limit=opts["limit"],
+                              project_filter=opts["project_filter"],
+                              source_filter=opts["source_filter"]))
     elif "--save" in sys.argv:
         idx = sys.argv.index("--save")
         arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
@@ -3000,12 +3071,12 @@ if __name__ == "__main__":
         ).fetchone()
         source = (row[0] if row and row[0] else "claude")
 
-        binary = _resume_binary(source)
-        # TTY → exec the right binary --resume; otherwise print the command paste-ready.
+        argv = _resume_argv(source, sid)
+        # TTY → exec the source's full-resume command; else print it paste-ready.
         if sys.stdout.isatty():
-            os.execvp(binary, [binary, "--resume", sid])
+            os.execvp(argv[0], argv)
         else:
-            print(f"{binary} --resume {sid}")
+            print(_resume_cmd(source, sid))
     elif "--install-hooks" in sys.argv:
         print(_install_hooks())
     elif "--show" in sys.argv:

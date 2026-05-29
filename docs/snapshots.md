@@ -78,8 +78,10 @@ with full history. `s` writes the snapshot to `REFRESH_PENDING` and execs a fres
 `claude` so the SessionStart hook injects the snapshot — same path as `clexo
 load`. `q` or empty input quits without doing anything.
 
-Codex rows are marked `[codex]`; selecting one in `r` mode prints the
-`codex resume` command instead of execing claude.
+Codex rows are marked `[codex]`; selecting one in `r` mode execs `codex resume
+<id>` (Codex's own full-resume command) rather than `claude --resume`. Grok rows
+exec `grok --resume <id>`. The right binary for the session's source is always
+chosen automatically.
 
 ## The fast path: `!clexo save`
 
