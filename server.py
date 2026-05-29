@@ -5,6 +5,7 @@ Claude Code + Codex chat search MCP server.
 Indexes:
   ~/.claude/projects/**/*.jsonl   (Claude Code sessions)
   ~/.codex/sessions/**/*.jsonl    (Codex sessions)
+  ~/.grok/sessions/**/*.jsonl     (Grok Build sessions) — added recently
 
 Self-updates via byte-offset tracking on every search call.
 SessionEnd hook also calls: python server.py --sync
@@ -30,6 +31,7 @@ DB_PATH            = CLEXO_DIR / "index.db"
 CLAUDE_PROJECTS    = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS     = Path.home() / ".codex" / "sessions"
 CODEX_SESSION_IDX  = Path.home() / ".codex" / "session_index.jsonl"
+GROK_SESSIONS      = Path.home() / ".grok" / "sessions"
 REFRESH_PENDING    = CLEXO_DIR / "refresh-pending"
 
 _UUID_RE      = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
@@ -426,6 +428,93 @@ def _sync_codex(conn) -> int:
     return total
 
 
+# ── Grok Build sessions (additive, does not touch Claude/Codex logic) ────────
+
+def _sync_grok(conn: sqlite3.Connection) -> int:
+    """Index Grok Build sessions from ~/.grok/sessions.
+
+    We only touch files under GROK_SESSIONS. Existing Claude/Codex behavior
+    is completely untouched.
+    """
+    if not GROK_SESSIONS.exists():
+        return 0
+
+    total = 0
+
+    # Walk all chat_history.jsonl files (cleaner for conversational content)
+    for chat_file in GROK_SESSIONS.glob("*/*/chat_history.jsonl"):
+        try:
+            # Derive session_id from parent directory name
+            session_id = chat_file.parent.name
+            # Derive project/cwd from the grandparent directory name (URL-encoded)
+            encoded_cwd = chat_file.parent.parent.name
+            project = encoded_cwd.replace("%2F", "/").lstrip("/")
+
+            # Track offset for incremental sync (reuse the same file_state table)
+            row = conn.execute(
+                "SELECT last_offset FROM file_state WHERE filepath = ?",
+                [str(chat_file)]
+            ).fetchone()
+            last_offset = row[0] if row else 0
+
+            new_offset = chat_file.stat().st_size
+            if new_offset <= last_offset:
+                continue
+
+            with open(chat_file, "rb") as f:
+                f.seek(last_offset)
+                for raw_line in f:
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        obj = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg_type = obj.get("type")
+                    if msg_type not in ("user", "assistant"):
+                        continue
+
+                    content = obj.get("content", [])
+                    texts = []
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                texts.append(part.get("text", ""))
+                    elif isinstance(content, str):
+                        texts.append(content)
+
+                    text = "\n".join(t for t in texts if t).strip()
+                    if not text or _is_system_noise(text):
+                        continue
+
+                    role = "user" if msg_type == "user" else "assistant"
+                    ts = obj.get("timestamp") or ""
+
+                    conn.execute("""
+                        INSERT INTO messages(session_id, project, role, content, ts)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, [session_id, project, role, text, ts])
+
+                    total += 1
+
+                    # Ensure session row exists
+                    conn.execute("""
+                        INSERT OR IGNORE INTO sessions(session_id, project, first_user_msg, last_ts, cwd, source)
+                        VALUES (?, ?, '', ?, ?, 'grok')
+                    """, [session_id, project, ts, project])
+
+            conn.execute("INSERT OR REPLACE INTO file_state VALUES(?, ?)", [str(chat_file), new_offset])
+
+        except Exception as e:
+            if _debug_enabled():
+                print(f"[clexo sync grok] {chat_file}: {e}", file=sys.stderr)
+            continue
+
+    conn.commit()
+    return total
+
+
 # ── backfill titles for already-indexed Claude sessions ──────────────────────
 
 def _backfill_claude_titles(conn) -> int:
@@ -515,7 +604,7 @@ def sync_all(conn: sqlite3.Connection = None, throttle: bool = False) -> int:
     owned = conn is None
     if owned:
         conn = get_db()
-    total = _sync_claude(conn) + _sync_codex(conn)
+    total = _sync_claude(conn) + _sync_codex(conn) + _sync_grok(conn)
     _backfill_claude_titles(conn)
     if total > 0:
         _stat("messages_indexed", total, conn)
@@ -527,10 +616,18 @@ def sync_all(conn: sqlite3.Connection = None, throttle: bool = False) -> int:
 
 # ── helpers for search output ─────────────────────────────────────────────────
 
+def _resume_binary(source: str) -> str:
+    """Return the correct CLI binary for a given session source."""
+    if source == "grok":
+        return "grok"
+    return "claude"
+
+
 def _resume_cmd(source: str, session_id: str) -> str:
     if source == "codex":
         return ""   # codex resume only works as a terminal command; not actionable in-session
-    return f"claude --resume {session_id}"
+    binary = _resume_binary(source)
+    return f"{binary} --resume {session_id}"
 
 
 # Single source of truth for prefixes that mark system-injected (non-user) text.
@@ -1649,15 +1746,19 @@ def _run_server():
     @app.tool()
     def search(query: str = "", limit: int = 10, project_filter: str = "",
                source_filter: str = "") -> str:
-        """Full-text search across the indexed archive of all past Claude Code
-        and Codex sessions — every user message, assistant reply, and tool
-        result. The broad entry point for any backward reference to prior
-        conversation.
+        """Full-text search across the indexed archive of all past Claude Code,
+        Codex, and Grok Build sessions — every user message, assistant reply,
+        and tool result. The broad entry point for any backward reference to
+        prior conversation.
 
         Use whenever the user points back to earlier work not in current
         context — e.g. "did we discuss the CSRF fix?", "remember when we
         migrated the database?", "what was that nginx config?", "find that
         session about the OOM bug", "list recent sessions in this project".
+
+        **To search ONLY Grok Build sessions** (recommended when working inside Grok):
+            Use source_filter="grok"
+            Example: search("auth middleware", source_filter="grok")
 
         Returns ranked sessions with snippets. Then:
           load(session_id)                          — session summary
@@ -1672,7 +1773,8 @@ def _run_server():
             query: Search terms; omit to list recent sessions
             limit: Max results (default 10)
             project_filter: Partial project path e.g. "myapp"; use "this"/"cwd"/"." for current project
-            source_filter: "claude" or "codex" to restrict to one AI
+            source_filter: "claude", "codex", or "grok" to restrict to sessions from one AI.
+                           Use source_filter="grok" to search only Grok Build history.
         """
         pf = _resolve_project_filter(project_filter)
         if not query.strip():
@@ -1709,6 +1811,24 @@ def _run_server():
                 out.append("")
             return "\n".join(out)
         return _search(query, limit=limit, project_filter=pf, source_filter=source_filter)
+
+    @app.tool()
+    def grok_search(query: str = "", limit: int = 10, project_filter: str = "") -> str:
+        """Convenience tool to search *only* Grok Build sessions.
+
+        Equivalent to calling search() with source_filter="grok" hardcoded.
+
+        Use this when working inside Grok Build and you only want to search
+        your previous Grok sessions (not Claude or Codex history).
+
+        Examples:
+          - "Search my previous Grok sessions for the auth middleware discussion"
+          - "Find what we talked about in earlier Grok sessions about the media skill"
+
+        Returns ranked Grok sessions with snippets.
+        Then use load(session_id) or pick() for more details.
+        """
+        return _search(query, limit=limit, project_filter=project_filter, source_filter="grok")
 
     def get_session_excerpt(
         session_id: str,
@@ -2647,7 +2767,8 @@ def _search_picker(query: str) -> None:
         if source == "codex":
             print(_resume_cmd("codex", sid))
             return
-        os.execvp("claude", ["claude", "--resume", sid])
+        binary = _resume_binary(source or "claude")
+        os.execvp(binary, [binary, "--resume", sid])
     else:
         chain_f   = CLEXO_DIR / f"chain-{sid}.md"
         refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
@@ -2657,7 +2778,8 @@ def _search_picker(query: str) -> None:
                 print(result, file=sys.stderr)
                 sys.exit(1)
         REFRESH_PENDING.write_text(sid)
-        os.execvp("claude", ["claude"])
+        binary = _resume_binary(source or "claude")
+        os.execvp(binary, [binary])
 
 
 def _resume_picker() -> None:
@@ -2665,8 +2787,8 @@ def _resume_picker() -> None:
 
     Lists the 20 most-recently-active sessions and prompts the user to pick
     one. Selection format: `N` (default mode = full resume) or `N r` / `N s`
-    where r = resume full session (execs `claude --resume <uuid>`) and
-    s = load snapshot (same flow as `clexo load`). `q` or empty quits.
+    where r = resume full session (execs the correct binary --resume <uuid>
+    for claude/grok) and s = load snapshot. `q` or empty quits.
     """
     if not sys.stdout.isatty():
         print("clexo resume (no args) requires an interactive terminal.", file=sys.stderr)
@@ -2728,7 +2850,8 @@ def _resume_picker() -> None:
         if source == "codex":
             print(_resume_cmd("codex", sid))
             return
-        os.execvp("claude", ["claude", "--resume", sid])
+        binary = _resume_binary(source or "claude")
+        os.execvp(binary, [binary, "--resume", sid])
     else:
         chain_f   = CLEXO_DIR / f"chain-{sid}.md"
         refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
@@ -2738,7 +2861,8 @@ def _resume_picker() -> None:
                 print(result, file=sys.stderr)
                 sys.exit(1)
         REFRESH_PENDING.write_text(sid)
-        os.execvp("claude", ["claude"])
+        binary = _resume_binary(source or "claude")
+        os.execvp(binary, [binary])
 
 
 if __name__ == "__main__":
@@ -2844,12 +2968,16 @@ if __name__ == "__main__":
                 print(save_result, file=sys.stderr)
                 sys.exit(1)
         REFRESH_PENDING.write_text(sid)
-        # TTY → exec claude (fresh session; SessionStart hook injects snapshot).
+        # TTY → exec the right binary (fresh session; SessionStart hook injects snapshot).
         # Non-tty → print the command paste-ready.
+        db = get_db()
+        row = db.execute("SELECT source FROM sessions WHERE session_id = ?", [sid]).fetchone()
+        src = (row[0] if row and row[0] else "claude")
+        binary = _resume_binary(src)
         if sys.stdout.isatty():
-            os.execvp("claude", ["claude"])
+            os.execvp(binary, [binary])
         else:
-            print(f"Snapshot ready for {sid}. Run: claude")
+            print(f"Snapshot ready for {sid}. Run: {binary}")
     elif "--resume" in sys.argv:
         idx = sys.argv.index("--resume")
         if idx + 1 >= len(sys.argv):
@@ -2863,11 +2991,21 @@ if __name__ == "__main__":
                   f"8-4-4-4-12) and not a known tag. "
                   f"Run `clexo tags` to list.", file=sys.stderr)
             sys.exit(1)
-        # TTY → exec claude --resume; otherwise print the command paste-ready.
+
+        # Look up the source so we can use the correct binary (grok vs claude)
+        db = get_db()
+        row = db.execute(
+            "SELECT source FROM sessions WHERE session_id = ?",
+            [sid]
+        ).fetchone()
+        source = (row[0] if row and row[0] else "claude")
+
+        binary = _resume_binary(source)
+        # TTY → exec the right binary --resume; otherwise print the command paste-ready.
         if sys.stdout.isatty():
-            os.execvp("claude", ["claude", "--resume", sid])
+            os.execvp(binary, [binary, "--resume", sid])
         else:
-            print(f"claude --resume {sid}")
+            print(f"{binary} --resume {sid}")
     elif "--install-hooks" in sys.argv:
         print(_install_hooks())
     elif "--show" in sys.argv:
