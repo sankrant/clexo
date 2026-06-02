@@ -708,3 +708,45 @@ def test_exec_resume_degrades_to_load_when_reaped(tmp_path, monkeypatch):
                         lambda *a: (_ for _ in ()).throw(AssertionError("should not exec --resume")))
     server._exec_resume(sid, "claude")
     assert calls == {"sid": sid, "src": "claude"}   # degraded to load
+
+
+def test_archive_retention_default_is_forever(tmp_path, monkeypatch):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    db = server.get_db()
+    assert server._archive_retention_days() == 0          # no config → forever
+    sid = "11110000-0000-0000-0000-000000000001"
+    db.execute("INSERT INTO sessions(session_id, source, last_ts) VALUES(?,?,?)",
+               [sid, "claude", "2020-01-01T00:00:00+00:00"])   # ancient
+    db.commit()
+    arc = server._archive_path(sid, "claude")
+    arc.parent.mkdir(parents=True, exist_ok=True)
+    arc.write_bytes(b"x")
+    assert server._prune_archives(db) == 0
+    assert arc.exists()                                   # kept forever
+
+
+def test_archive_retention_prunes_old_keeps_recent_and_tagged(tmp_path, monkeypatch):
+    import datetime as _dt
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    (tmp_path / "config.json").write_text(json.dumps({"archive_retention_days": 180}))
+    db = server.get_db()
+    old    = (_dt.datetime.now().astimezone() - _dt.timedelta(days=400)).isoformat()
+    recent = (_dt.datetime.now().astimezone() - _dt.timedelta(days=10)).isoformat()
+    rows = [
+        ("aaaa0000-0000-0000-0000-000000000001", old),     # old, untagged → prune
+        ("bbbb0000-0000-0000-0000-000000000002", recent),  # recent → keep
+        ("cccc0000-0000-0000-0000-000000000003", old),     # old but tagged → keep
+    ]
+    for sid, ts in rows:
+        db.execute("INSERT INTO sessions(session_id, source, last_ts) VALUES(?,?,?)",
+                   [sid, "claude", ts])
+        a = server._archive_path(sid, "claude")
+        a.parent.mkdir(parents=True, exist_ok=True)
+        a.write_bytes(b"x")
+    db.execute("INSERT INTO tags(tag, session_id, created_ts) VALUES('keepme', ?, ?)",
+               [rows[2][0], "t"])
+    db.commit()
+    assert server._prune_archives(db) == 1
+    assert not server._archive_path(rows[0][0], "claude").exists()   # old pruned
+    assert server._archive_path(rows[1][0], "claude").exists()       # recent kept
+    assert server._archive_path(rows[2][0], "claude").exists()       # tagged kept

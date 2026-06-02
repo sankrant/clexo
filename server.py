@@ -633,6 +633,7 @@ def sync_all(conn: sqlite3.Connection = None, throttle: bool = False) -> int:
         conn = get_db()
     total = _sync_claude(conn) + _sync_codex(conn) + _sync_grok(conn)
     _backfill_claude_titles(conn)
+    _prune_archives(conn)
     if total > 0:
         _stat("messages_indexed", total, conn)
     if owned:
@@ -1399,6 +1400,48 @@ def _materialize_archive(session_id: str, source: str) -> Path | None:
         return dest
     except Exception:
         return None
+
+
+def _archive_retention_days() -> int:
+    """How long to keep clexo's transcript archives, from the
+    `archive_retention_days` config key. 0 / absent = keep forever (default)."""
+    try:
+        val = json.loads((CLEXO_DIR / "config.json").read_text()).get("archive_retention_days", 0)
+        return int(val or 0)
+    except Exception:
+        return 0
+
+
+def _prune_archives(conn: sqlite3.Connection) -> int:
+    """Delete archives (and their cache files) for sessions whose last activity
+    is older than the configured retention. No-op at the default (forever).
+    Tagged sessions are always kept. Only ever touches clexo's own archive —
+    never Claude's/Codex's source files."""
+    days = _archive_retention_days()
+    if days <= 0 or not ARCHIVE_DIR.exists():
+        return 0
+    cutoff = (datetime.datetime.now().astimezone()
+              - datetime.timedelta(days=days)).isoformat()[:10]
+    tagged = {r[0] for r in conn.execute("SELECT DISTINCT session_id FROM tags")}
+    last_ts = {r[0]: (r[1] or "") for r in
+               conn.execute("SELECT session_id, last_ts FROM sessions")}
+    removed = 0
+    for gz in ARCHIVE_DIR.glob("*/*.jsonl.gz"):
+        sid = gz.name[:-len(".jsonl.gz")]
+        if sid in tagged:
+            continue
+        lt = last_ts.get(sid, "")
+        # Fall back to the archive's own mtime when the session isn't indexed.
+        when = lt[:10] if lt else datetime.datetime.fromtimestamp(
+            gz.stat().st_mtime).astimezone().isoformat()[:10]
+        if when < cutoff:
+            try:
+                gz.unlink()
+                (ARCHIVE_CACHE / gz.parent.name / gz.name[:-3]).unlink(missing_ok=True)
+                removed += 1
+            except Exception:
+                pass
+    return removed
 
 
 def _live_session_jsonl(session_id: str, source: str = "claude") -> Path | None:

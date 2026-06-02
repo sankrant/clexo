@@ -69,6 +69,17 @@ also self-heals a deleted archive.
 This is for clexo's own recall (`pick`, `load`, snapshot rebuild) — **not** for
 `claude --resume`, which needs the verbatim file Claude owns.
 
+**Retention.** Archives are kept **forever** by default. Set
+`archive_retention_days` in `~/.clexo/config.json` to cap it — each sync then prunes
+archives for sessions whose last activity is older than that many days (`_prune_archives`).
+Tagged sessions are always kept regardless of age, and pruning only ever deletes
+clexo's own `archive/`+`cache/` files — never the Claude/Codex source tree.
+
+```jsonc
+// ~/.clexo/config.json
+{ "archive_retention_days": 0 }   // 0 or absent = forever; e.g. 365 = keep one year
+```
+
 ### The reader gate
 
 All of this hinges on one rule: **writers take direct paths, readers go through a

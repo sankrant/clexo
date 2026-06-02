@@ -1,4 +1,5 @@
 {
   "refresh_tokens_min": 4000,
-  "refresh_tokens_max": 8000
+  "refresh_tokens_max": 8000,
+  "archive_retention_days": 0
 }
