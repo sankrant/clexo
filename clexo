@@ -35,7 +35,7 @@ case "$cmd" in
     "$PYTHON" "$SERVER" --tag "$@"
     ;;
   tags)
-    "$PYTHON" "$SERVER" --tags
+    "$PYTHON" "$SERVER" --tags "$@"
     ;;
   untag)
     "$PYTHON" "$SERVER" --untag "$@"
@@ -68,7 +68,10 @@ case "$cmd" in
     echo "Tags:"
     echo "  tag <name> [--force] [sid]"
     echo "                       Tag current (or given) session; --force to replace"
-    echo "  tags                 List all tags with session info"
+    echo "  tags [--short] [--keywords]"
+    echo "                       List all tags with session info, newest first"
+    echo "                       (--short: name + date only; --keywords: add"
+    echo "                       TF-IDF keywords — slower)"
     echo "  untag <name>         Remove a tag"
     echo "  load <name|sid>      Set pending snapshot + launch claude (fresh"
     echo "                       session; SessionStart hook injects snapshot)"

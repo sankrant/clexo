@@ -8,7 +8,9 @@ clexo tag auth-fix                     # tag the current session with a chosen n
 clexo tag auth-fix <session-uuid>      # tag a specific session
 clexo tag auth-fix --force             # replace an existing tag
 
-clexo tags                             # list all tags with summary + keywords
+clexo tags                             # list all tags (newest first) with summary
+clexo tags --short                     # compact: tag name + date, newest first
+clexo tags --keywords                  # add per-session TF-IDF keywords (slower)
 clexo untag auth-fix                   # remove a tag
 
 clexo load auth-fix                    # load the snapshot (snapshot, not full session)
@@ -85,6 +87,9 @@ The old session is untagged but not deleted — the snapshot and index are untou
 
 ## `clexo tags` output
 
+Tags are listed newest-first, by the target session's last activity (falling back to
+the tag's creation date for sessions not in the index).
+
 ```
 3 tag(s):
 
@@ -92,13 +97,40 @@ The old session is untagged but not deleted — the snapshot and index are untou
     Title: Fix CSRF in auth middleware
     Opening: csrf token error on /api/checkout
     Last: shipped to staging, verified — closing
-    Keywords: csrf, middleware, token, webapp, checkout, session, cookie
 
 @deploy-debug  →  ...
 ```
 
-Keywords are TF-IDF over the session's messages (user text weighted 3×). They're a
-quick "what was this about" signal when you've forgotten which tag was which.
+Add `--keywords` to append a TF-IDF keyword line per session:
+
+```
+@auth-fix  →  8f3a72b1-...  [claude] Users/alex/Code/webapp  (last: 2026-05-15)
+    Title: Fix CSRF in auth middleware
+    Opening: csrf token error on /api/checkout
+    Last: shipped to staging, verified — closing
+    Keywords: csrf, middleware, token, webapp, checkout, session, cookie
+```
+
+Keywords are TF-IDF over the session's messages (user text weighted 3×) — a quick
+"what was this about" signal when you've forgotten which tag was which. They're opt-in
+because computing them runs an FTS lookup per candidate word, which makes the listing
+noticeably slower; the default and `--short` listings skip them. Over MCP, the `tags`
+tool exposes both as `tags(short=True)` / `tags(keywords=True)`.
+
+For a quick scan, `clexo tags --short` drops everything but the tag name and date,
+sorted newest-first (most recent session activity at the top):
+
+```
+50 tag(s):
+
+@en-in-investigate-foreign-word  2026-06-02
+@webapp-resume-previous-coding  2026-06-01
+@lalatex-continue-spec           2026-05-31
+```
+
+The date is the session's last activity (the same `last:` shown in the full listing),
+falling back to the tag's creation date for sessions not in the index. Over MCP, the
+`tags` tool takes the same option as `tags(short=True)`.
 
 ## When to tag
 

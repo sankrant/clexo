@@ -139,7 +139,7 @@ clexo search <query>                 Search chat history
 clexo save [sid|tag]                 Snapshot the current (or given) session
 
 clexo tag <name> [--force] [sid]     Tag the current (or given) session
-clexo tags                           List tags with summary + keywords
+clexo tags [--short|--keywords]      List tags, newest first (--short: name+date)
 clexo untag <name>                   Remove a tag
 clexo load <name|sid>                Set pending snapshot and launch a fresh claude
                                      (SessionStart hook injects the snapshot)
@@ -170,7 +170,7 @@ When clexo is registered as an MCP server, Claude can invoke these directly. You
 | `save` | Snapshot the current session for restore on the next start. |
 | `pick` | Drill into a session's raw exchanges (incl. tool output). FTS-anchored; supports `before`/`after` scroll. Accepts UUID or tag. |
 | `tag` | Assign a friendly name to a session. Collisions return a "exists, pass `replace=True` or pick a new name" prompt. |
-| `tags` | List all tags with each session's summary, opening/closing lines, and TF-IDF keywords. |
+| `tags` | List all tags (newest first) with each session's summary and opening/closing lines. `short=True` for just name+date; `keywords=True` to add TF-IDF keywords. |
 | `untag` | Remove a tag mapping. |
 | `get_stats` | Usage counters. |
 

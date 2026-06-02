@@ -300,6 +300,56 @@ def test_format_tags_with_entries(isolated_db):
     assert sid in out
 
 
+def test_format_tags_short_empty(isolated_db):
+    assert "No tags yet" in server._format_tags(short=True)
+
+
+def test_format_tags_short_is_compact(isolated_db):
+    sid = "11111111-2222-3333-4444-555555555555"
+    server._create_tag("zeta", sid)
+    out = server._format_tags(short=True)
+    assert "@zeta" in out
+    # Compact mode: tag name + date, no session id / opening / keywords.
+    assert sid not in out
+    assert "Opening:" not in out and "Keywords:" not in out
+
+
+def test_format_tags_short_reverse_date_order(isolated_db):
+    db = server.get_db()
+    # Two tagged sessions with known last-activity dates; expect newest first.
+    for sid, last in [
+        ("11111111-1111-1111-1111-111111111111", "2026-01-10T00:00:00+05:30"),
+        ("22222222-2222-2222-2222-222222222222", "2026-05-20T00:00:00+05:30"),
+    ]:
+        db.execute("INSERT INTO sessions(session_id, source, last_ts) VALUES(?,?,?)",
+                   [sid, "claude", last])
+    db.commit()
+    server._create_tag("older", "11111111-1111-1111-1111-111111111111")
+    server._create_tag("newer", "22222222-2222-2222-2222-222222222222")
+    out = server._format_tags(short=True)
+    assert out.index("@newer") < out.index("@older")
+    assert "2026-05-20" in out and "2026-01-10" in out
+    # Long mode shares the same newest-first ordering.
+    long_out = server._format_tags()
+    assert long_out.index("@newer") < long_out.index("@older")
+
+
+def test_format_tags_keywords_opt_in(isolated_db):
+    db = server.get_db()
+    sid = "33333333-3333-3333-3333-333333333333"
+    db.execute("INSERT INTO sessions(session_id, source) VALUES(?,?)", [sid, "claude"])
+    db.execute(
+        "INSERT INTO messages(session_id, role, content) VALUES(?,?,?)",
+        [sid, "user", "kubernetes kubernetes ingress ingress controller controller"],
+    )
+    db.commit()
+    server._create_tag("kube", sid)
+    # Default long mode omits the (expensive) keyword line.
+    assert "Keywords:" not in server._format_tags()
+    # Opt-in restores it.
+    assert "Keywords:" in server._format_tags(keywords=True)
+
+
 def test_create_tag_rejects_bad_uuid(isolated_db):
     out = server._create_tag("badsid", "not-a-uuid")
     assert "doesn't look like a UUID" in out

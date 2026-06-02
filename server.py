@@ -1038,13 +1038,16 @@ _SUMMARY_RE   = re.compile(r'^#{2,3}\s+Summary\s*\n(.*?)(?=^#{2,3}\s+|\Z)',
 
 
 def _session_keywords(db: sqlite3.Connection, session_id: str,
-                      top: int = 8, idf_cache: dict | None = None) -> list[str]:
+                      top: int = 8, idf_cache: dict | None = None,
+                      n_sessions: int | None = None) -> list[str]:
     """Top TF-IDF keywords for a session.
 
     User messages weighted 3× (they're the topic signal); assistant text 1×.
     Filters: stopword list, min raw count 2 (drops typos/one-offs), letters
     and underscores only, 3–31 chars. IDF computed against the full FTS index;
-    pass a shared `idf_cache` dict to amortize across multiple sessions.
+    pass a shared `idf_cache` dict to amortize across multiple sessions, and
+    `n_sessions` (the index-wide session count) to skip recomputing that
+    constant per call.
     """
     rows = db.execute(
         "SELECT role, content FROM messages WHERE session_id=?", [session_id]
@@ -1068,7 +1071,9 @@ def _session_keywords(db: sqlite3.Connection, session_id: str,
     if not candidates:
         return []
 
-    N = db.execute("SELECT COUNT(DISTINCT session_id) FROM messages").fetchone()[0] or 1
+    N = n_sessions if n_sessions is not None else \
+        db.execute("SELECT COUNT(DISTINCT session_id) FROM messages").fetchone()[0]
+    N = N or 1
 
     scored = []
     for w in candidates:
@@ -1108,19 +1113,38 @@ def _chain_summary(sid: str) -> str:
     return ""
 
 
-def _format_tags() -> str:
+def _format_tags(short: bool = False, keywords: bool = False) -> str:
     db = get_db()
     rows = db.execute("""
         SELECT t.tag, t.session_id, t.created_ts,
                s.source, s.project, s.thread_name, s.summary, s.last_ts
         FROM tags t
         LEFT JOIN sessions s ON s.session_id = t.session_id
-        ORDER BY t.tag
+        ORDER BY COALESCE(s.last_ts, t.created_ts) DESC
     """).fetchall()
     if not rows:
         return "No tags yet. Create one with tag(name='<friendly-name>')."
 
+    if short:
+        # Compact listing: "@tag  YYYY-MM-DD", newest activity first (rows are
+        # already date-sorted above). Date is the session's last activity
+        # (last_ts), falling back to when the tag was created for sessions not
+        # in the index.
+        def _date(row):
+            return (row[7] or row[2] or "")[:10]
+        width = max(len(row[0]) for row in rows)
+        out = [f"{len(rows)} tag(s):\n"]
+        for row in rows:
+            out.append(f"@{row[0]:<{width}}  {_date(row) or '?'}")
+        return "\n".join(out)
+
     idf_cache: dict = {}
+    # Keyword TF-IDF is the expensive part of this listing (~860 FTS lookups
+    # for 50 tags), so it's opt-in via `keywords`. The index-wide session count
+    # it needs is constant across all tags — compute it once, not per session.
+    n_sessions = db.execute(
+        "SELECT COUNT(DISTINCT session_id) FROM messages").fetchone()[0] \
+        if keywords else 0
     out = [f"{len(rows)} tag(s):\n"]
     for tag, sid, _created, source, project, thread_name, summary, last_ts in rows:
         src  = source or "claude"
@@ -1143,9 +1167,11 @@ def _format_tags() -> str:
             for j, line in enumerate(_session_summary(db, sid)):
                 prefix = "Opening:" if j == 0 else "Last:"
                 out.append(f"    {prefix} {line}")
-            kws = _session_keywords(db, sid, top=8, idf_cache=idf_cache)
-            if kws:
-                out.append(f"    Keywords: {', '.join(kws)}")
+            if keywords:
+                kws = _session_keywords(db, sid, top=8, idf_cache=idf_cache,
+                                        n_sessions=n_sessions)
+                if kws:
+                    out.append(f"    Keywords: {', '.join(kws)}")
         out.append("")
     return "\n".join(out).rstrip()
 
@@ -2133,11 +2159,13 @@ def _run_server():
         return _remove_tag(name)
 
     @app.tool()
-    def tags() -> str:
+    def tags(short: bool = False, keywords: bool = False) -> str:
         """List all tags with their target sessions, opening/closing lines, and
         any saved summary. Use when the user asks "what tags do I have?",
-        "list my tagged sessions", etc."""
-        return _format_tags()
+        "list my tagged sessions", etc. Pass short=True for a compact listing of
+        just tag name + date, newest first. Pass keywords=True to add per-session
+        TF-IDF keywords (slower — it runs an FTS lookup per candidate word)."""
+        return _format_tags(short=short, keywords=keywords)
 
     @app.tool()
     def pick(args: str = "", session_id: str = "") -> str:
@@ -3019,7 +3047,8 @@ if __name__ == "__main__":
         if out.startswith("No tag") or out.startswith("Error:"):
             sys.exit(2)
     elif "--tags" in sys.argv:
-        print(_format_tags())
+        print(_format_tags(short="--short" in sys.argv,
+                           keywords="--keywords" in sys.argv))
     elif "--load" in sys.argv:
         idx = sys.argv.index("--load")
         arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
