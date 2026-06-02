@@ -82,6 +82,8 @@ def _isolate_clexo_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "DB_PATH",          tmp_path / "index.db")
     monkeypatch.setattr(server, "REFRESH_PENDING",  tmp_path / "refresh-pending")
     monkeypatch.setattr(server, "_CHAIN_LOADED",    tmp_path / "chain-loaded")
+    monkeypatch.setattr(server, "ARCHIVE_DIR",      tmp_path / "archive")
+    monkeypatch.setattr(server, "ARCHIVE_CACHE",    tmp_path / "cache")
 
 
 def test_refresh_load_no_pending(tmp_path, monkeypatch):
@@ -605,3 +607,104 @@ def test_resolve_current_cwd_fallback_when_env_jsonl_missing(tmp_path, monkeypat
 
     sid, _ = server._resolve_current_or_given_session()
     assert sid == target_sid
+
+
+# ── Durable transcript archive ────────────────────────────────────────────────
+
+def test_strip_archive_line_claude_keeps_commands_drops_output():
+    # assistant turn: text + tool_use (command) + thinking → keep text + tool_use
+    asst = {
+        "type": "assistant", "timestamp": "t1",
+        "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "secret reasoning"},
+            {"type": "text", "text": "running it"},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls -la"}},
+        ]},
+    }
+    kept = server._strip_archive_line(asst, "claude")
+    types = [b["type"] for b in kept["message"]["content"]]
+    assert types == ["text", "tool_use"]          # thinking dropped
+    assert kept["message"]["content"][1]["input"]["command"] == "ls -la"
+
+    # a pure tool_result carrier (user message) → dropped entirely
+    tr = {"type": "user", "toolUseResult": {"stdout": "..."},
+          "message": {"role": "user", "content": [
+              {"type": "tool_result", "content": "huge output"}]}}
+    assert server._strip_archive_line(tr, "claude") is None
+
+    # non user/assistant line → dropped
+    assert server._strip_archive_line({"type": "ai-title"}, "claude") is None
+
+
+def test_strip_archive_line_codex():
+    user = {"type": "event_msg", "timestamp": "t",
+            "payload": {"type": "user_message", "message": "hi"}}
+    assert server._strip_archive_line(user, "codex")["payload"]["message"] == "hi"
+    asst = {"type": "response_item", "timestamp": "t",
+            "payload": {"role": "assistant",
+                        "content": [{"type": "output_text", "text": "yo"}]}}
+    assert server._strip_archive_line(asst, "codex")["payload"]["role"] == "assistant"
+    # function output (tool result) → dropped
+    fout = {"type": "response_item", "payload": {"type": "function_call_output"}}
+    assert server._strip_archive_line(fout, "codex") is None
+
+
+def _write_fake_claude_session(tmp_path, monkeypatch, sid):
+    proj = tmp_path / "claude_projects" / "-Users-x-proj"
+    proj.mkdir(parents=True)
+    monkeypatch.setattr(server, "CLAUDE_PROJECTS", tmp_path / "claude_projects")
+    lines = [
+        {"type": "user", "timestamp": "t0",
+         "message": {"role": "user", "content": "do the thing"}},
+        {"type": "assistant", "timestamp": "t1",
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "name": "Bash", "input": {"command": "make build"}}]}},
+        {"type": "user", "timestamp": "t2",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "content": "BIG TOOL OUTPUT"}]}},
+    ]
+    f = proj / f"{sid}.jsonl"
+    f.write_text("\n".join(json.dumps(o) for o in lines) + "\n")
+    return f
+
+
+def test_archive_roundtrip_and_gate_fallback(tmp_path, monkeypatch):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+    live = _write_fake_claude_session(tmp_path, monkeypatch, sid)
+
+    # gate returns the live file while it exists
+    assert server._find_session_jsonl(sid, "claude") == live
+
+    # archive it, then simulate Claude's reap
+    server._write_archive(sid, "claude", live)
+    assert server._archive_path(sid, "claude").exists()
+    live.unlink()
+    assert server._live_session_jsonl(sid, "claude") is None
+
+    # gate now falls back to the materialized archive
+    gated = server._find_session_jsonl(sid, "claude")
+    assert gated is not None and "cache" in str(gated)
+
+    # transcript survives: command kept, tool output gone
+    msgs = server._read_raw_messages(gated, "claude")
+    rendered = "\n".join(server._extract_content(m["content"]) for m in msgs)
+    assert "make build" in rendered           # tool command preserved
+    assert "BIG TOOL OUTPUT" not in rendered   # tool output dropped
+
+
+def test_exec_resume_degrades_to_load_when_reaped(tmp_path, monkeypatch):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "aaaabbbb-cccc-dddd-eeee-ffff00002222"
+    live = _write_fake_claude_session(tmp_path, monkeypatch, sid)
+    server._write_archive(sid, "claude", live)
+    live.unlink()  # reaped
+
+    calls = {}
+    monkeypatch.setattr(server, "_exec_load",
+                        lambda s, src="claude", allow_print=True: calls.update(sid=s, src=src))
+    # would otherwise os.execvp; ensure it never reaches a true resume
+    monkeypatch.setattr(server.os, "execvp",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("should not exec --resume")))
+    server._exec_resume(sid, "claude")
+    assert calls == {"sid": sid, "src": "claude"}   # degraded to load

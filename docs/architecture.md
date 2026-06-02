@@ -49,6 +49,41 @@ CREATE TABLE file_state (
 This means re-indexing a 10 MB session file after 50 KB of new messages takes a few ms,
 not seconds.
 
+## Durable transcript archive
+
+Claude Code deletes session JSONLs after `cleanupPeriodDays` (default 30). Everything
+that reads a session at retrieval time — `pick`, snapshot generation, `load` — opens
+the live file, so without intervention old sessions silently stop being recallable.
+
+clexo keeps its own compact copy. On every sync, alongside indexing, it writes a
+gzipped transcript per session to `~/.clexo/archive/<source>/<uuid>.jsonl.gz`
+(`_write_archive`). The transcript keeps every user/assistant turn and every tool
+**command**, but drops tool **output**, thinking, images, snapshots and per-line
+metadata — that bulk is either in git or re-run on current data, so it's dead weight
+for recall. The result is ~10× smaller than the raw JSONL and stays in the source's
+native shape, so the existing readers parse it unchanged. Sessions are archived when
+they end (the SessionEnd hook runs an unthrottled sync) and backfilled lazily: a sync
+that skips an already-indexed file still writes its archive if one is missing, which
+also self-heals a deleted archive.
+
+This is for clexo's own recall (`pick`, `load`, snapshot rebuild) — **not** for
+`claude --resume`, which needs the verbatim file Claude owns.
+
+### The reader gate
+
+All of this hinges on one rule: **writers take direct paths, readers go through a
+gate.**
+
+- **Writers** (`_sync_claude`, `_sync_codex`, `_write_archive`) glob the live source
+  tree directly — they're building the index/archive *from* live files.
+- **Readers** resolve sessions through `_find_session_jsonl(session_id, source)`, which
+  returns the live file if it exists, else materializes the archive into
+  `~/.clexo/cache/` and returns that. The archive fallback lives in exactly this one
+  function, so `pick`, `refresh_save`, `load` and `show` all inherit it for free.
+- **Resume** is the one path that needs the *real* live file (`_live_session_jsonl`,
+  no fallback). `clexo resume` on a reaped session degrades to `clexo load` —
+  rebuilding the snapshot from the archive into a fresh session — instead of failing.
+
 ## Schema
 
 ```sql

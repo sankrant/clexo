@@ -15,6 +15,7 @@ Run sync only     : python server.py --sync
 """
 
 import datetime
+import gzip
 import json
 import math
 import os
@@ -28,6 +29,8 @@ from pathlib import Path
 CLEXO_DIR          = Path.home() / ".clexo"
 
 DB_PATH            = CLEXO_DIR / "index.db"
+ARCHIVE_DIR        = CLEXO_DIR / "archive"      # gzipped transcript per session
+ARCHIVE_CACHE      = CLEXO_DIR / "cache"        # decompressed-on-demand for readers
 CLAUDE_PROJECTS    = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS     = Path.home() / ".codex" / "sessions"
 CODEX_SESSION_IDX  = Path.home() / ".codex" / "session_index.jsonl"
@@ -134,7 +137,18 @@ def _extract_claude_text(content) -> str:
             elif t == "tool_use":
                 name = block.get("name", "")
                 inp = block.get("input", {})
-                vals = " ".join(str(v)[:200] for v in inp.values() if isinstance(v, str)) if isinstance(inp, dict) else str(inp)[:200]
+                if isinstance(inp, dict):
+                    # Index command-bearing fields in full (so search recalls real
+                    # commands and paths), but cap other fields so a Write/MultiEdit
+                    # body — the whole file contents — doesn't flood the index.
+                    cmd_keys = ("command", "file_path", "path", "pattern", "query", "url")
+                    primary = " ".join(str(inp[k]) for k in cmd_keys
+                                       if isinstance(inp.get(k), str))
+                    rest = " ".join(str(v)[:200] for k, v in inp.items()
+                                    if isinstance(v, str) and k not in cmd_keys)
+                    vals = (primary + " " + rest).strip()[:2000]
+                else:
+                    vals = str(inp)[:2000]
                 parts.append(f"[{name}] {vals}")
         return " ".join(parts)
     return ""
@@ -206,10 +220,14 @@ def _sync_claude(conn) -> int:
             fp = str(jsonl_file)
             row = conn.execute("SELECT last_offset FROM file_state WHERE filepath=?", [fp]).fetchone()
             last_offset = row[0] if row else 0
+            session_id = jsonl_file.stem
             if stat.st_size <= last_offset:
+                # Already fully indexed — but make sure it's archived (one-time
+                # backfill of existing sessions; self-heals a deleted archive).
+                if not _archive_path(session_id, "claude").exists():
+                    _write_archive(session_id, "claude", jsonl_file)
                 continue
 
-            session_id = jsonl_file.stem
             project    = jsonl_file.parent.name
             new_offset = last_offset
 
@@ -282,6 +300,10 @@ def _sync_claude(conn) -> int:
 
             conn.execute("INSERT OR REPLACE INTO file_state VALUES(?,?)", [fp, new_offset])
 
+            # Refresh the durable transcript archive so this session survives
+            # Claude's ~30-day cleanup of the source file.
+            _write_archive(session_id, "claude", jsonl_file)
+
             if assistant_turns_this_pass > 0:
                 if prefix_input > 0:
                     conn.execute("""
@@ -335,14 +357,18 @@ def _sync_codex(conn) -> int:
             fp = f"codex:{jsonl_file}"
             row = conn.execute("SELECT last_offset FROM file_state WHERE filepath=?", [fp]).fetchone()
             last_offset = row[0] if row else 0
-            if stat.st_size <= last_offset:
-                continue
 
             # Extract UUID from filename: rollout-YYYY-MM-DDThh-mm-ss-{uuid}.jsonl
             m = _UUID_RE.search(jsonl_file.stem)
             if not m:
                 continue
             session_id  = m.group(0)
+
+            if stat.st_size <= last_offset:
+                if not _archive_path(session_id, "codex").exists():
+                    _write_archive(session_id, "codex", jsonl_file)
+                continue
+
             thread_name = thread_names.get(session_id, "")
             cwd         = ""
             project     = ""
@@ -419,6 +445,7 @@ def _sync_codex(conn) -> int:
                             break
 
             conn.execute("INSERT OR REPLACE INTO file_state VALUES(?,?)", [fp, new_offset])
+            _write_archive(session_id, "codex", jsonl_file)
         except Exception as e:
             if _debug_enabled():
                 print(f"[clexo sync codex] {jsonl_file}: {e}", file=sys.stderr)
@@ -649,6 +676,61 @@ def _resume_footer(source: str, session_id: str, indent: str = "    ") -> list[s
         f"{indent}Resume: clexo resume {session_id}   (full session · {underlying})",
         f"{indent}Load:   clexo load {session_id}   (compacted snapshot)",
     ]
+
+
+# ── Centralized resume / load exec (the only places that launch a CLI) ────────
+
+def _ensure_snapshot(session_id: str) -> str | None:
+    """Make sure a snapshot exists for a session, building one if absent.
+    Returns an error string if the session can't be found anywhere (live or
+    archive), else None. refresh_save reads through the archive gate, so this
+    works even after Claude has reaped the live file."""
+    chain_f   = CLEXO_DIR / f"chain-{session_id}.md"
+    refresh_f = CLEXO_DIR / f"refresh-{session_id}.md"
+    if chain_f.exists() or refresh_f.exists():
+        return None
+    result = refresh_save(session_id)
+    return result if result.startswith("No session JSONL") else None
+
+
+def _exec_load(session_id: str, source: str = "claude", allow_print: bool = True) -> None:
+    """Load a session's compacted snapshot into a fresh CLI session (the
+    SessionStart hook injects it). Builds the snapshot first if missing — works
+    for reaped sessions, since the snapshot is rebuilt from the archive."""
+    err = _ensure_snapshot(session_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(1)
+    REFRESH_PENDING.write_text(session_id)
+    binary = _resume_binary(source or "claude")
+    if sys.stdout.isatty():
+        os.execvp(binary, [binary])
+    elif allow_print:
+        print(f"Snapshot ready for {session_id}. Run: {binary}")
+
+
+def _exec_resume(session_id: str, source: str = "claude", allow_print: bool = True) -> None:
+    """The single resume entry point. Degrades gracefully when the live file is
+    gone: live source present → true `<cli> --resume`; reaped but archived →
+    load clexo's reconstructed snapshot into a fresh session instead."""
+    source = source or "claude"
+    if _live_session_jsonl(session_id, source):
+        argv = _resume_argv(source, session_id)
+        if sys.stdout.isatty():
+            os.execvp(argv[0], argv)
+        elif allow_print:
+            print(_resume_cmd(source, session_id))
+        return
+    # Live file reaped by Claude/Codex — fall back to the archived snapshot.
+    if _materialize_archive(session_id, source):
+        print(f"Live session {session_id[:8]}… was reaped by {source}; loading "
+              f"clexo's archived snapshot into a fresh session instead.",
+              file=sys.stderr)
+        _exec_load(session_id, source, allow_print=allow_print)
+        return
+    print(f"Session {session_id[:8]}… not found: no live file and no clexo archive.",
+          file=sys.stderr)
+    sys.exit(1)
 
 
 # Single source of truth for prefixes that mark system-injected (non-user) text.
@@ -1220,12 +1302,133 @@ def _format_for_summary(db: sqlite3.Connection, session_id: str, char_limit: int
 
 # ── session excerpt (raw JSONL window) ───────────────────────────────────────
 
-def _find_session_jsonl(session_id: str, source: str = "claude") -> Path | None:
+# ── Durable transcript archive ────────────────────────────────────────────────
+# Claude reaps session JSONLs after ~30 days (the cleanupPeriodDays default), so
+# pick(), snapshots and load() — which all read the live file — silently lose old
+# sessions. clexo keeps its own compact, gzipped transcript per session: every
+# user/assistant turn and every tool *command*, but NOT tool output, thinking,
+# images, snapshots or per-line metadata (tool output is either in git or re-run
+# on current data, so it is dead weight here). The archive stays in the source's
+# native JSONL shape, so the existing readers parse it unchanged once it is
+# materialized back. Verbatim `claude --resume` needs the original file and is a
+# non-goal; this serves clexo's own resume/recall instead.
+
+def _archive_path(session_id: str, source: str) -> Path:
+    return ARCHIVE_DIR / source / f"{session_id}.jsonl.gz"
+
+
+def _strip_archive_line(obj: dict, source: str) -> dict | None:
+    """Reduce one source JSONL line to transcript essentials, or None to drop it.
+
+    Keeps user/assistant text and tool-use commands; drops tool_result/
+    toolUseResult, thinking, images and heavy metadata. Output keeps the
+    source's native shape so _read_raw_messages parses it unchanged."""
+    if source == "codex":
+        p = obj.get("payload")
+        if not isinstance(p, dict):
+            return None
+        t = obj.get("type")
+        ts = obj.get("timestamp", "")
+        if t == "event_msg" and p.get("type") == "user_message":
+            return {"type": t, "timestamp": ts, "payload": p}
+        if t == "response_item" and p.get("role") == "assistant":
+            blocks = [b for b in p.get("content", [])
+                      if isinstance(b, dict) and b.get("type") in ("output_text", "text")]
+            if blocks:
+                return {"type": t, "timestamp": ts,
+                        "payload": {"role": "assistant", "content": blocks}}
+        return None
+    # claude / grok: type + message{role, content}
+    if obj.get("type") not in ("user", "assistant"):
+        return None
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if isinstance(content, list):
+        kept = [b for b in content if isinstance(b, dict)
+                and b.get("type") in ("text", "tool_use")]
+        if not kept:
+            return None
+        content = kept
+    elif isinstance(content, str):
+        if not content.strip():
+            return None
+    else:
+        return None
+    return {"type": obj["type"], "timestamp": obj.get("timestamp", ""),
+            "message": {"role": msg.get("role", obj["type"]), "content": content}}
+
+
+def _write_archive(session_id: str, source: str, src_jsonl: Path) -> None:
+    """(Re)write the gzipped transcript archive for one session. Best-effort:
+    archiving must never break a sync."""
+    try:
+        out = _archive_path(session_id, source)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(src_jsonl, encoding="utf-8") as fin, \
+                gzip.open(out, "wt", encoding="utf-8") as fout:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                kept = _strip_archive_line(obj, source)
+                if kept is not None:
+                    fout.write(json.dumps(kept, ensure_ascii=False) + "\n")
+    except Exception as e:
+        if _debug_enabled():
+            print(f"[clexo archive] {session_id}: {e}", file=sys.stderr)
+
+
+def _materialize_archive(session_id: str, source: str) -> Path | None:
+    """Decompress a session's archive into a cache file the readers can open.
+    Returns the cache path, or None if no archive exists."""
+    arc = _archive_path(session_id, source)
+    if not arc.exists():
+        return None
+    dest = ARCHIVE_CACHE / source / f"{session_id}.jsonl"
+    try:
+        if not dest.exists() or dest.stat().st_mtime < arc.stat().st_mtime:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(arc, "rt", encoding="utf-8") as fin:
+                dest.write_text(fin.read(), encoding="utf-8")
+        return dest
+    except Exception:
+        return None
+
+
+def _live_session_jsonl(session_id: str, source: str = "claude") -> Path | None:
+    """The on-disk source file, or None once Claude/Codex has reaped it. No
+    archive fallback. For writers (sync, archive) and the resume liveness gate —
+    callers that specifically need the *real* live file."""
     if source == "codex":
         hits = list(CODEX_SESSIONS.glob(f"**/*{session_id}*.jsonl"))
     else:
         hits = list(CLAUDE_PROJECTS.glob(f"*/{session_id}.jsonl"))
     return hits[0] if hits else None
+
+
+def _find_session_jsonl(session_id: str, source: str = "claude") -> Path | None:
+    """THE reader gate. A readable JSONL for this session: the live source file
+    if it still exists, else the materialized archive. Every reader path (pick,
+    snapshot, load, show) resolves sessions through here, so the archive
+    fallback lives in exactly one place. Writers must NOT call this — they use
+    _live_session_jsonl / the sync globs directly."""
+    return _live_session_jsonl(session_id, source) or _materialize_archive(session_id, source)
+
+
+def _resolve_reader_jsonl(session_id: str) -> tuple[Path | None, str]:
+    """Reader gate with source auto-detection: try claude then codex,
+    live-or-archive. Returns (path or None, source)."""
+    for src in ("claude", "codex"):
+        p = _find_session_jsonl(session_id, src)
+        if p:
+            return p, src
+    return None, "claude"
 
 
 def _is_user_text(msg: dict) -> bool:
@@ -1243,9 +1446,12 @@ def _is_user_text(msg: dict) -> bool:
     return False
 
 
-def _read_raw_messages(jsonl_file: Path) -> list[dict]:
-    """All user/assistant messages from JSONL including tool_result blocks."""
-    if CODEX_SESSIONS in jsonl_file.parents:
+def _read_raw_messages(jsonl_file: Path, source: str = "claude") -> list[dict]:
+    """All user/assistant messages from JSONL including tool_result blocks.
+
+    `source` routes the parser; it matters for archive cache files, which live
+    under ~/.clexo/cache/ rather than the original source tree."""
+    if source == "codex" or CODEX_SESSIONS in jsonl_file.parents:
         return _read_raw_messages_codex(jsonl_file)
     msgs = []
     with open(jsonl_file) as f:
@@ -1651,11 +1857,9 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
 
     source = "claude"
     if session_id:
-        hits = list(CLAUDE_PROJECTS.glob(f"*/{session_id}.jsonl"))
-        if not hits and CODEX_SESSIONS.exists():
-            hits = list(CODEX_SESSIONS.glob(f"**/*{session_id}*.jsonl"))
-            source = "codex" if hits else "claude"
-        jsonl = hits[0] if hits else None
+        # Reader path → through the archive-aware gate, so a snapshot can still
+        # be built after Claude has reaped the live file.
+        jsonl, source = _resolve_reader_jsonl(session_id)
     else:
         all_files = list(CLAUDE_PROJECTS.glob("*/*.jsonl"))
         if CODEX_SESSIONS.exists():
@@ -1770,7 +1974,10 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
     ))[:20]
 
     date            = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
-    project_display = jsonl.parent.name.lstrip('-').replace('-', '/')
+    # Prefer the indexed project name; jsonl.parent is meaningless for an archive
+    # cache file (it lives under ~/.clexo/cache/<source>/).
+    project_raw     = (sess[4] if sess and len(sess) > 4 and sess[4] else jsonl.parent.name)
+    project_display = (project_raw or "").lstrip('-').replace('-', '/')
     section_header  = f"## Session {session_id} | {date} | {source} | {project_display}"
     section_body    = (
         f"### Summary\n{summary}\n\n"
@@ -1962,7 +2169,7 @@ def _run_server():
         if not jsonl:
             return f"JSONL file not found for session {session_id}."
 
-        msgs = _read_raw_messages(jsonl)
+        msgs = _read_raw_messages(jsonl, source)
         if not msgs:
             return "No messages found in session file."
 
@@ -2867,19 +3074,9 @@ def _search_picker(query: str) -> None:
 
     sid, source = items[n - 1]
     if mode == "r":
-        argv = _resume_argv(source or "claude", sid)
-        os.execvp(argv[0], argv)
+        _exec_resume(sid, source)
     else:
-        chain_f   = CLEXO_DIR / f"chain-{sid}.md"
-        refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
-        if not chain_f.exists() and not refresh_f.exists():
-            result = refresh_save(sid)
-            if result.startswith("No session JSONL"):
-                print(result, file=sys.stderr)
-                sys.exit(1)
-        REFRESH_PENDING.write_text(sid)
-        binary = _resume_binary(source or "claude")
-        os.execvp(binary, [binary])
+        _exec_load(sid, source)
 
 
 def _resume_picker() -> None:
@@ -2947,19 +3144,9 @@ def _resume_picker() -> None:
 
     sid, source = items[n - 1]
     if mode == "r":
-        argv = _resume_argv(source or "claude", sid)
-        os.execvp(argv[0], argv)
+        _exec_resume(sid, source)
     else:
-        chain_f   = CLEXO_DIR / f"chain-{sid}.md"
-        refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
-        if not chain_f.exists() and not refresh_f.exists():
-            result = refresh_save(sid)
-            if result.startswith("No session JSONL"):
-                print(result, file=sys.stderr)
-                sys.exit(1)
-        REFRESH_PENDING.write_text(sid)
-        binary = _resume_binary(source or "claude")
-        os.execvp(binary, [binary])
+        _exec_load(sid, source)
 
 
 if __name__ == "__main__":
@@ -3060,24 +3247,13 @@ if __name__ == "__main__":
             # Not a UUID or known tag — treat as a search query and show picker.
             _search_picker(arg)
             sys.exit(0)
-        chain_f   = CLEXO_DIR / f"chain-{sid}.md"
-        refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
-        if not chain_f.exists() and not refresh_f.exists():
-            save_result = refresh_save(sid)
-            if save_result.startswith("No session JSONL"):
-                print(save_result, file=sys.stderr)
-                sys.exit(1)
-        REFRESH_PENDING.write_text(sid)
-        # TTY → exec the right binary (fresh session; SessionStart hook injects snapshot).
-        # Non-tty → print the command paste-ready.
+        # TTY → exec the right binary (fresh session; SessionStart hook injects
+        # snapshot). Non-tty → print the command paste-ready. Reaped sessions
+        # rebuild the snapshot from the archive inside _exec_load.
         db = get_db()
         row = db.execute("SELECT source FROM sessions WHERE session_id = ?", [sid]).fetchone()
         src = (row[0] if row and row[0] else "claude")
-        binary = _resume_binary(src)
-        if sys.stdout.isatty():
-            os.execvp(binary, [binary])
-        else:
-            print(f"Snapshot ready for {sid}. Run: {binary}")
+        _exec_load(sid, src)
     elif "--resume" in sys.argv:
         idx = sys.argv.index("--resume")
         if idx + 1 >= len(sys.argv):
@@ -3092,7 +3268,7 @@ if __name__ == "__main__":
                   f"Run `clexo tags` to list.", file=sys.stderr)
             sys.exit(1)
 
-        # Look up the source so we can use the correct binary (grok vs claude)
+        # Look up the source so we can use the correct binary (grok vs claude).
         db = get_db()
         row = db.execute(
             "SELECT source FROM sessions WHERE session_id = ?",
@@ -3100,12 +3276,9 @@ if __name__ == "__main__":
         ).fetchone()
         source = (row[0] if row and row[0] else "claude")
 
-        argv = _resume_argv(source, sid)
-        # TTY → exec the source's full-resume command; else print it paste-ready.
-        if sys.stdout.isatty():
-            os.execvp(argv[0], argv)
-        else:
-            print(_resume_cmd(source, sid))
+        # TTY → exec full-resume (degrades to snapshot-load if the live file was
+        # reaped); else print the command paste-ready.
+        _exec_resume(sid, source)
     elif "--install-hooks" in sys.argv:
         print(_install_hooks())
     elif "--show" in sys.argv:
@@ -3121,13 +3294,10 @@ if __name__ == "__main__":
             sys.exit(1)
         # Ensure a snapshot exists, then print it without touching REFRESH_PENDING
         # (so we don't accidentally schedule a restore on the next claude startup).
-        chain_f   = CLEXO_DIR / f"chain-{sid}.md"
-        refresh_f = CLEXO_DIR / f"refresh-{sid}.md"
-        if not chain_f.exists() and not refresh_f.exists():
-            save_result = refresh_save(sid)
-            if save_result.startswith("No session JSONL"):
-                print(save_result, file=sys.stderr)
-                sys.exit(1)
+        err = _ensure_snapshot(sid)
+        if err:
+            print(err, file=sys.stderr)
+            sys.exit(1)
         print(_refresh_load(sid))
     else:
         _run_server()

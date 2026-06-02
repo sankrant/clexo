@@ -12,7 +12,10 @@ current session that contains:
 
 The snapshot is intentionally small: it is the **continuity payload**, not the full
 transcript. The full transcript is already on disk in Claude Code's or Codex's session
-file; clexo reads from there when you need older detail (via `pick`).
+file; clexo reads from there when you need older detail (via `pick`). Once Claude
+reaps that file (after ~30 days), clexo transparently falls back to its own gzipped
+transcript archive — so `pick`, `load` and snapshot rebuilds keep working. See
+[architecture.md](architecture.md#durable-transcript-archive).
 
 ## Where the files live
 
@@ -74,7 +77,9 @@ Mode: [r] resume full session  [s] load snapshot  [q] quit
 
 Selection format is `N` (defaults to `r` = full session) or `N r` / `N s` for an
 explicit mode. `r` execs `claude --resume <uuid>` — reopens the original session
-with full history. `s` writes the snapshot to `REFRESH_PENDING` and execs a fresh
+with full history. If that session has already been reaped by Claude, `r` degrades
+to `s` automatically (it loads clexo's archived snapshot into a fresh session rather
+than failing). `s` writes the snapshot to `REFRESH_PENDING` and execs a fresh
 `claude` so the SessionStart hook injects the snapshot — same path as `clexo
 load`. `q` or empty input quits without doing anything.
 
