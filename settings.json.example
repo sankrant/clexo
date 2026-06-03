@@ -1,5 +1,5 @@
 {
-  "_comment": "Minimal example showing the SessionStart + SessionEnd hooks clexo uses. Merge these into your ~/.claude/settings.json — replace /absolute/path/to/clexo with where you cloned this repo. JSON does not support comments; remove the _comment keys before use.",
+  "_comment": "Minimal example showing the SessionStart + SessionEnd hooks clexo uses. The recommended way to install these is `clexo install` (or `clexo install-hooks`), which wires them into ~/.claude/settings.json and backs the file up first. This file is for reference / manual merging. Assumes `clexo` is on your PATH (pipx/uv put it there). JSON does not support comments; remove the _comment keys before use.",
 
   "hooks": {
     "SessionStart": [
@@ -9,7 +9,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /absolute/path/to/clexo/server.py --session-start"
+            "command": "clexo session-start"
           }
         ]
       }
@@ -21,7 +21,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'python3 /absolute/path/to/clexo/server.py --sync >> /tmp/clexo-sync.log 2>&1 &'"
+            "command": "bash -c 'clexo sync >> /tmp/clexo-sync.log 2>&1 &'"
           }
         ]
       }

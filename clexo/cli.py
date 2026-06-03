@@ -8,10 +8,10 @@ Indexes:
   ~/.grok/sessions/**/*.jsonl     (Grok Build sessions) — added recently
 
 Self-updates via byte-offset tracking on every search call.
-SessionEnd hook also calls: python server.py --sync
+SessionEnd hook also calls: clexo sync
 
-Run as MCP server : python server.py
-Run sync only     : python server.py --sync
+Run as MCP server : clexo serve
+Run sync only     : clexo sync
 """
 
 import datetime
@@ -20,7 +20,9 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -2290,7 +2292,7 @@ def _run_server():
             if anchor_idx is None:
                 # FTS matched a ts not in the loaded msgs — index/file out of sync.
                 return (f"Internal: FTS-matched ts not present in session JSONL. "
-                        f"Try `python server.py --sync` to re-index.")
+                        f"Try `clexo sync` to re-index.")
             window = _extract_window(msgs, anchor_idx, before, after)
 
         start_i = next((i for i, m in enumerate(msgs) if m["ts"] == window[0]["ts"]), 0)
@@ -2842,17 +2844,25 @@ def _session_start_hook() -> None:
     }))
 
 
+def _clexo_cmd() -> str:
+    """How a Claude Code hook should invoke clexo. Prefer the absolute path to the
+    installed console script (hooks may run with a minimal PATH); fall back to the
+    `python -m clexo` module form so it still works from a bare checkout / venv."""
+    exe = shutil.which("clexo")
+    return exe if exe else f"{sys.executable} -m clexo"
+
+
 def _install_hooks(settings_path: Path | None = None) -> str:
     """Idempotently add the SessionStart + SessionEnd hooks to Claude Code's
-    settings.json. Backs up + writes ONLY if the JSON actually changes. Skips
-    if our commands are already present (matched on the --session-start /
-    --sync flags plus a path containing 'clexo')."""
+    settings.json. Backs up + writes ONLY if the JSON actually changes. Recognises
+    our hooks (and stale older ones) by the session-start / sync markers plus
+    'clexo' in the command, re-pointing the command in place when it has drifted."""
     settings_dir = (settings_path.parent if settings_path
                     else Path.home() / ".claude")
     settings_path = settings_path or (settings_dir / "settings.json")
-    server_abs = str(Path(__file__).resolve())
-    start_cmd  = f"python3 {server_abs} --session-start"
-    end_cmd    = f"bash -c 'python3 {server_abs} --sync >> /tmp/clexo-sync.log 2>&1 &'"
+    clexo = _clexo_cmd()
+    start_cmd  = f"{clexo} session-start"
+    end_cmd    = f"bash -c '{clexo} sync >> /tmp/clexo-sync.log 2>&1 &'"
 
     raw = ""
     if settings_path.exists():
@@ -2876,7 +2886,7 @@ def _install_hooks(settings_path: Path | None = None) -> str:
         for he in entries if isinstance(entries, list) else []:
             for h in he.get("hooks", []) if isinstance(he, dict) else []:
                 cmd = h.get("command", "") if isinstance(h, dict) else ""
-                if marker in cmd and ("clexo" in cmd.lower() or server_abs in cmd):
+                if marker in cmd and "clexo" in cmd.lower():
                     return True
         return False
 
@@ -2892,13 +2902,20 @@ def _install_hooks(settings_path: Path | None = None) -> str:
                 if not isinstance(h, dict):
                     continue
                 cmd = h.get("command", "")
-                if marker in cmd and ("clexo" in cmd.lower() or server_abs in cmd):
+                if marker in cmd and "clexo" in cmd.lower():
+                    changed = False
                     if e.get("matcher") != matcher:
                         old = e.get("matcher", "")
                         e["matcher"] = matcher
                         change_lines.append(
                             f"  ✎ {label}: matcher updated {old!r} → {matcher!r}")
-                    else:
+                        changed = True
+                    if h.get("command") != command:
+                        h["command"] = command
+                        change_lines.append(
+                            f"  ✎ {label}: command re-pointed → {command!r}")
+                        changed = True
+                    if not changed:
                         change_lines.append(f"  ↻ {label}: already installed")
                     return
         # Not present — append to existing entry with the same matcher, or create one.
@@ -2913,8 +2930,8 @@ def _install_hooks(settings_path: Path | None = None) -> str:
     try:
         # SessionStart matcher fires on startup AND clear (not resume/compact).
         # This is what enables `clexo load <sid>` then `claude` to restore.
-        _add("SessionStart", "startup|clear", "--session-start", start_cmd, "SessionStart hook")
-        _add("SessionEnd",   "",              "--sync",          end_cmd,   "SessionEnd hook")
+        _add("SessionStart", "startup|clear", "session-start", start_cmd, "SessionStart hook")
+        _add("SessionEnd",   "",              "sync",          end_cmd,   "SessionEnd hook")
     except ValueError as e:
         return f"Error: {e}. Aborted (no changes written)."
 
@@ -3192,7 +3209,7 @@ def _resume_picker() -> None:
         _exec_load(sid, source)
 
 
-if __name__ == "__main__":
+def _dispatch():
     if "--sync" in sys.argv:
         n = sync_all()
         print(f"Indexed {n} new messages.", flush=True)
@@ -3270,7 +3287,7 @@ if __name__ == "__main__":
     elif "--untag" in sys.argv:
         idx = sys.argv.index("--untag")
         if idx + 1 >= len(sys.argv):
-            print("Usage: server.py --untag <name>", file=sys.stderr)
+            print("Usage: clexo untag <name>", file=sys.stderr)
             sys.exit(1)
         out = _remove_tag(sys.argv[idx + 1])
         print(out)
@@ -3283,7 +3300,7 @@ if __name__ == "__main__":
         idx = sys.argv.index("--load")
         arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
         if not arg:
-            print("Usage: server.py --load <tag-or-uuid>", file=sys.stderr)
+            print("Usage: clexo load <tag-or-uuid>", file=sys.stderr)
             sys.exit(1)
         sid = _resolve_session_or_tag(arg)
         if not _TAG_UUID_RE.match(sid.lower()):
@@ -3328,7 +3345,7 @@ if __name__ == "__main__":
         idx = sys.argv.index("--show")
         arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
         if not arg:
-            print("Usage: server.py --show <tag-or-uuid>", file=sys.stderr)
+            print("Usage: clexo show <tag-or-uuid>", file=sys.stderr)
             sys.exit(1)
         sid = _resolve_session_or_tag(arg)
         if not _TAG_UUID_RE.match(sid.lower()):
@@ -3344,3 +3361,144 @@ if __name__ == "__main__":
         print(_refresh_load(sid))
     else:
         _run_server()
+
+
+_USAGE = """\
+Usage: clexo <command>
+
+Commands:
+  serve                Run the MCP server (Claude Code registers this as `clexo serve`)
+  install              Wire clexo into Claude Code (MCP server + hooks); re-runnable
+  stats / gain         Show usage stats
+  sync                 Index new messages now
+  search [query]       Search chat history (empty lists recent)
+                       [--source_filter claude|codex|grok]
+                       [--project_filter <name>|this] [--limit N]
+  save [sid|tag]       Snapshot current (or given) session for restore
+
+Tags:
+  tag <name> [--force] [sid]   Tag current (or given) session; --force to replace
+  tags [--short] [--keywords]  List all tags with session info, newest first
+  untag <name>                 Remove a tag
+  load <name|sid>              Set pending snapshot + launch claude (fresh session;
+                               the SessionStart hook injects the snapshot)
+  resume [name|sid]            Resume the original session (claude --resume); with
+                               no arg, an interactive picker over recent sessions
+  show <name|sid>              Print the saved snapshot to stdout (inspect only)
+
+Setup:
+  install-hooks        Wire just the SessionStart + SessionEnd hooks
+"""
+
+
+def _wire_mcp() -> int:
+    """Register clexo's MCP server with Claude Code as `clexo serve`. Idempotent;
+    re-points a stale registration left by an older install (python3 .../server.py)."""
+    claude = shutil.which("claude")
+    if not claude:
+        print("  ⚠ claude CLI not found on PATH — skipping MCP registration.")
+        print("    After installing it, run:")
+        print("      claude mcp add --scope user clexo clexo serve")
+        return 0
+    try:
+        listing = subprocess.run(
+            [claude, "mcp", "list"], capture_output=True, text=True, timeout=30
+        ).stdout
+    except Exception as e:                       # best-effort wiring
+        print(f"  ⚠ could not run `claude mcp list` ({e}); skipping MCP step.")
+        return 0
+    entry = next((ln for ln in listing.splitlines()
+                  if re.match(r'^\s*clexo[\s:]', ln)), None)
+    if entry is None:
+        subprocess.run([claude, "mcp", "add", "--scope", "user",
+                        "clexo", "clexo", "serve"], check=False)
+        print("  + MCP server registered: clexo serve")
+    elif "serve" in entry and "server.py" not in entry:
+        print("  ↻ MCP server already registered (clexo serve)")
+    else:
+        subprocess.run([claude, "mcp", "remove", "--scope", "user", "clexo"],
+                       check=False)
+        subprocess.run([claude, "mcp", "add", "--scope", "user",
+                        "clexo", "clexo", "serve"], check=False)
+        print("  ✎ MCP server re-pointed: clexo serve")
+    return 0
+
+
+def _heal_old_symlink() -> None:
+    """Remove a stale ~/.local/bin/clexo symlink left by the old bash-wrapper
+    install. Only ever unlinks a symlink (never a real file), and only when the
+    active `clexo` console script resolves somewhere else."""
+    link = Path.home() / ".local" / "bin" / "clexo"
+    if not link.is_symlink():
+        return
+    installed = shutil.which("clexo")
+    target = os.path.realpath(link)
+    if installed and os.path.realpath(installed) == target:
+        return                                   # this symlink IS the live clexo
+    try:
+        link.unlink()
+        print(f"  ✗ removed stale wrapper symlink: {link} → {target or '(dangling)'}")
+    except OSError as e:
+        print(f"  ⚠ could not remove old symlink {link}: {e}")
+
+
+def _cmd_install() -> int:
+    """`clexo install` — wire the MCP server + hooks into Claude Code and clean up
+    any older bash-wrapper install. Safe to re-run."""
+    print("clexo install — wiring into Claude Code\n")
+    rc = _wire_mcp()
+    print(_install_hooks())
+    _heal_old_symlink()
+    print("\nDone. Try: clexo help")
+    return rc
+
+
+def main(argv=None):
+    """Console entry point. Maps friendly subcommands onto the internal flag
+    dispatch, so `clexo save` etc. work without the old bash wrapper."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    cmd = args[0] if args else ""
+
+    if cmd in ("", "help", "-h", "--help"):
+        print(_USAGE)
+        return
+    if cmd == "serve":
+        _run_server()
+        return
+    if cmd == "install":
+        sys.exit(_cmd_install())
+
+    # Friendly subcommand → the internal --flag that _dispatch() understands.
+    SUBCMD = {
+        "sync":          "--sync",
+        "session-start": "--session-start",
+        "search":        "--search",
+        "tag":           "--tag",
+        "tags":          "--tags",
+        "untag":         "--untag",
+        "load":          "--load",
+        "resume":        "--resume",
+        "show":          "--show",
+        "install-hooks": "--install-hooks",
+    }
+    if cmd == "save":
+        # Default the session id to $CLAUDE_CODE_SESSION_ID when none is given,
+        # matching the old wrapper so `clexo save` snapshots the current session.
+        rest = args[1:]
+        if not rest:
+            sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+            rest = [sid] if sid else []
+        sys.argv = [sys.argv[0], "--save", *rest]
+    elif cmd in SUBCMD:
+        sys.argv = [sys.argv[0], SUBCMD[cmd], *args[1:]]
+    elif cmd in ("stats", "gain"):
+        sys.argv = [sys.argv[0], cmd]
+    else:
+        # Raw flags (`clexo --sync`) or anything else — pass through unchanged.
+        sys.argv = [sys.argv[0], *args]
+
+    _dispatch()
+
+
+if __name__ == "__main__":
+    main()

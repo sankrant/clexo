@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clexo"
+version = "0.1.0"
+description = "Session memory and cross-AI context for Claude Code and Codex"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+keywords = ["claude-code", "codex", "mcp", "session", "memory", "fts"]
+dependencies = ["mcp"]
+
+[project.scripts]
+clexo = "clexo.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sankrant/clexo"
+
+[tool.hatch.build.targets.wheel]
+packages = ["clexo"]

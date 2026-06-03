@@ -54,12 +54,13 @@ Zero daemon. No API key. Self-indexing on demand. Your AI sessions become a sear
 ## 🚀 Quick Start
 
 ```bash
-git clone https://github.com/sankrant/clexo
-cd clexo
-./install.sh
+pipx install git+https://github.com/sankrant/clexo
+clexo install
 ```
 
-`install.sh` verifies Python 3.10+, installs the `mcp` dependency, registers the MCP server with Claude Code, symlinks the `clexo` CLI onto your PATH, and prompts before installing the SessionStart + SessionEnd hooks (recommended — they enable the auto-restore behavior).
+`pipx` installs clexo into an isolated environment and puts the `clexo` command on your PATH — no system-Python pollution, and no "python3 too old", since pipx picks a suitable interpreter for you. `clexo install` then wires it into Claude Code: it registers the MCP server (`clexo serve`) and installs the SessionStart + SessionEnd hooks that enable auto-restore. Both are idempotent and safe to re-run.
+
+> No `pipx`? Add it with `brew install pipx` (macOS) or `python3 -m pip install --user pipx`. Prefer [`uv`](https://docs.astral.sh/uv/)? `uv tool install git+https://github.com/sankrant/clexo`. Working from a local checkout? `git clone … && cd clexo && ./install.sh` runs the same two steps.
 
 ### Try it
 
@@ -108,25 +109,31 @@ The `!` prefix matters: it runs `clexo save` as a bash command directly, bypassi
 
 ## ⚙️ Manual install
 
-If you'd rather not run the installer, the four steps it performs:
+`clexo install` does the Claude Code wiring for you. To do it by hand instead:
 
 ```bash
-# 1. Python dependency
-pip install -r requirements.txt
+# 1. Install the package (isolated)
+pipx install .            # from a checkout — or: pip install .
 
 # 2. Register the MCP server with Claude Code
-claude mcp add --scope user clexo python3 /absolute/path/to/clexo/server.py
+claude mcp add --scope user clexo clexo serve
 
-# 3. Put the CLI on your PATH
-ln -s /absolute/path/to/clexo/clexo ~/.local/bin/clexo
-
-# 4. (Recommended) install the hooks — enables auto-restore after /clear
+# 3. (Recommended) install the hooks — enables auto-restore after /clear
 clexo install-hooks
 #    or merge the hooks block from settings.json.example into
 #    ~/.claude/settings.json manually
 ```
 
-Verify the MCP server with `claude mcp list` — you should see `clexo: ... ✓ Connected`.
+Verify the MCP server with `claude mcp list` — you should see `clexo: clexo serve ✓ Connected`.
+
+### Upgrading
+
+```bash
+pipx install --force git+https://github.com/sankrant/clexo   # or: pipx upgrade clexo
+clexo install                                                # re-points hooks + MCP if needed
+```
+
+Upgrading from an older git-clone install? Same two commands — `clexo install` re-points the old `server.py`-based hooks and MCP registration to the `clexo` command (backing up `settings.json` first) and removes the stale `~/.local/bin/clexo` wrapper symlink.
 
 ---
 
@@ -149,8 +156,11 @@ clexo resume                         (no args) Interactive picker over recent
                                      sessions; choose resume / load mode
 clexo show <name|sid>                Print the saved snapshot to stdout (inspect only)
 
-clexo install-hooks                  Wire SessionStart + SessionEnd hooks into
-                                     ~/.claude/settings.json (idempotent; backs up first)
+clexo install                        Wire MCP server + hooks into Claude Code
+                                     (re-runnable; re-points an older install)
+clexo install-hooks                  Wire just the SessionStart + SessionEnd hooks
+                                     (idempotent; backs up settings.json first)
+clexo serve                          Run the MCP server (Claude Code invokes this)
 ```
 
 `load` vs `resume`: `load` is the clexo path — fresh session, compact snapshot, cheap context. `resume` is a friendly-name wrapper around `claude --resume <uuid>` — same session, full rehydrate, no clexo summarization.

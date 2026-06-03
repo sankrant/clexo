@@ -1,9 +1,9 @@
 # Architecture — internals
 
-clexo is a single-file Python program (`server.py`) that runs in two modes:
+clexo is a Python package (`clexo`, entry module `clexo/cli.py`) that runs in two modes:
 
-- **MCP server** — when invoked by Claude Code via its MCP transport
-- **CLI** — when invoked from a shell (via the `clexo` wrapper script)
+- **MCP server** — when invoked by Claude Code via its MCP transport (`clexo serve`)
+- **CLI** — when invoked from a shell (the `clexo` console command)
 
 Both modes share the same code paths and the same SQLite database
 (`~/.clexo/index.db`).
@@ -13,12 +13,12 @@ Both modes share the same code paths and the same SQLite database
 ```
                                        ┌────────────────────────┐
 ~/.claude/projects/**/*.jsonl  ────┐    │                        │
-                                   ├──→ │   server.py --sync     │ ──→ ~/.clexo/index.db
+                                   ├──→ │   clexo sync           │ ──→ ~/.clexo/index.db
 ~/.codex/sessions/**/*.jsonl   ────┘    │   (byte-offset tail)   │     (FTS5 + tags)
                                        └────────────────────────┘
 
                               save           ┌─────────────────────┐
-   Claude Code  ─── !clexo save ──────────→  │   server.py --save  │ ──→ ~/.clexo/chain-<sid>.md
+   Claude Code  ─── !clexo save ──────────→  │   clexo save        │ ──→ ~/.clexo/chain-<sid>.md
                                               └─────────────────────┘     + writes chain-loaded
 
                           /clear, new session
@@ -26,8 +26,7 @@ Both modes share the same code paths and the same SQLite database
                                   ▼
                        ┌─────────────────────────────┐
                        │ SessionStart hook fires:    │
-                       │ python3 server.py           │
-                       │   --session-start           │
+                       │ clexo session-start         │
                        │ → reads chain-loaded        │
                        │ → emits additionalContext   │
                        └─────────────────────────────┘
@@ -173,8 +172,8 @@ The hook reads this file, packs it under Claude Code's `additionalContext` budge
 
 ## MCP server
 
-`server.py` implements the [MCP](https://modelcontextprotocol.io/) protocol over stdio.
-Tools exposed:
+clexo implements the [MCP](https://modelcontextprotocol.io/) protocol over stdio
+(run via `clexo serve`). Tools exposed:
 
 | Tool | What it does |
 |------|--------------|

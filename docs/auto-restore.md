@@ -38,8 +38,8 @@ The right tool depends on what you need:
 ## Prerequisites
 
 This flow requires the `SessionStart` hook to be installed in
-`~/.claude/settings.json`. The `install.sh` script prompts to install it; you can also
-install it later with `clexo install-hooks`.
+`~/.claude/settings.json`. `clexo install` wires it up; you can also (re)install just
+the hooks later with `clexo install-hooks`.
 
 Without the hook, `clexo save` still writes the snapshot — you just have to run
 `clexo load <sid-or-tag>` manually after the new session starts to inject it.

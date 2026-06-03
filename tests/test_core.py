@@ -369,9 +369,9 @@ def test_install_hooks_creates_settings(tmp_path):
     end   = data["hooks"]["SessionEnd"]
     assert any(h["matcher"] == "startup|clear" for h in start)
     assert any(h["matcher"] == ""               for h in end)
-    assert any("--session-start" in h["command"]
+    assert any("session-start" in h["command"] and "server.py" not in h["command"]
                for entry in start for h in entry["hooks"])
-    assert any("--sync" in h["command"]
+    assert any("sync" in h["command"] and "server.py" not in h["command"]
                for entry in end   for h in entry["hooks"])
 
 
@@ -425,7 +425,7 @@ def test_install_hooks_appends_to_matching_matcher(tmp_path):
     assert len(start) == 1, "should reuse the existing matcher entry"
     commands = [h["command"] for h in start[0]["hooks"]]
     assert any("other-tool" in c for c in commands)
-    assert any("--session-start" in c for c in commands)
+    assert any("session-start" in c for c in commands)
 
 
 def test_install_hooks_creates_separate_entry_for_different_matcher(tmp_path):
@@ -465,6 +465,10 @@ def test_install_hooks_migrates_old_matcher(tmp_path):
     start = data["hooks"]["SessionStart"]
     assert len(start) == 1, "should update in place, not duplicate"
     assert start[0]["matcher"] == "startup|clear"
+    # The stale `python3 .../server.py` command should also be re-pointed to clexo.
+    assert "command re-pointed" in result
+    cmd = start[0]["hooks"][0]["command"]
+    assert "server.py" not in cmd and "session-start" in cmd
 
 
 def test_install_hooks_backs_up_existing(tmp_path):
@@ -483,6 +487,51 @@ def test_install_hooks_rejects_malformed_json(tmp_path):
     result = server._install_hooks(settings_path=settings)
     assert result.startswith("Error:")
     assert "not valid JSON" in result
+
+
+def test_install_hooks_emits_clexo_console_command(tmp_path, monkeypatch):
+    """Hooks should invoke the `clexo` console command, never `python3 server.py`."""
+    monkeypatch.setattr(server, "_clexo_cmd", lambda: "/fake/bin/clexo")
+    settings = tmp_path / "settings.json"
+    server._install_hooks(settings_path=settings)
+    data = json.loads(settings.read_text())
+    start_cmd = data["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    end_cmd   = data["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+    assert start_cmd == "/fake/bin/clexo session-start"
+    assert "/fake/bin/clexo sync" in end_cmd
+    assert "server.py" not in start_cmd and "python3" not in start_cmd
+
+
+def test_install_hooks_repoints_stale_command(tmp_path, monkeypatch):
+    """An older hook (python3 .../server.py --sync) with the right matcher gets its
+    command re-pointed in place to the clexo console form — no duplicate entry."""
+    monkeypatch.setattr(server, "_clexo_cmd", lambda: "/fake/bin/clexo")
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "hooks": {
+            "SessionEnd": [{"matcher": "", "hooks": [
+                {"type": "command",
+                 "command": "bash -c '/old/clexo/server.py --sync >> /tmp/x.log 2>&1 &'"}
+            ]}]
+        }
+    }))
+    result = server._install_hooks(settings_path=settings)
+    assert "command re-pointed" in result
+    data = json.loads(settings.read_text())
+    end = data["hooks"]["SessionEnd"]
+    assert len(end) == 1 and len(end[0]["hooks"]) == 1, "re-point in place, no duplicate"
+    cmd = end[0]["hooks"][0]["command"]
+    assert "/fake/bin/clexo sync" in cmd and "server.py" not in cmd
+
+
+def test_main_save_defaults_to_env(monkeypatch):
+    """`clexo save` with no arg snapshots $CLAUDE_CODE_SESSION_ID (old wrapper behavior)."""
+    captured = {}
+    monkeypatch.setattr(server, "_resolve_session_or_tag", lambda a: a)
+    monkeypatch.setattr(server, "refresh_save", lambda a: captured.setdefault("arg", a))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    server.main(["save"])
+    assert captured["arg"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 
 # ── Keyword extraction & chain summary ────────────────────────────────────────

@@ -11,40 +11,40 @@ Claude Code's `additionalContext` budget (~10 KB), and injects it into the new s
 **Effect:** after `!clexo save` and `/clear`, your next session is already restored.
 No manual `clexo load` needed.
 
-**Command it runs:** `python3 /path/to/server.py --session-start`
+**Command it runs:** `clexo session-start`
 
 ## SessionEnd — keep the index fresh
 
-**What it does:** when a session ends, runs `python3 server.py --sync` in the
+**What it does:** when a session ends, runs `clexo sync` in the
 background. This appends any new messages from the just-ended session to the FTS index
 so they're searchable on the next `clexo search`.
 
 **Effect:** searches find recent material. Without this hook, you'd have to run
 `clexo sync` manually before searching for something from the same day.
 
-**Command it runs:** `bash -c 'python3 /path/to/server.py --sync >> /tmp/clexo-sync.log 2>&1 &'`
+**Command it runs:** `bash -c 'clexo sync >> /tmp/clexo-sync.log 2>&1 &'`
 
 ## Installation
 
-Recommended: let the installer prompt you.
+Recommended: `clexo install` wires both hooks (and the MCP server) in one step.
 
 ```bash
-./install.sh
-# answer "y" at the SessionStart + SessionEnd prompt
+clexo install
 ```
 
-Install later if you skipped earlier:
+Hooks only — e.g. if you skipped them, or to re-point an older install:
 
 ```bash
 clexo install-hooks
 ```
 
-Manual: copy from `settings.json.example` into `~/.claude/settings.json`, replacing the
-`/absolute/path/to/clexo` placeholder.
+Manual: copy the hooks block from `settings.json.example` into
+`~/.claude/settings.json`. The commands assume `clexo` is on your PATH (pipx/uv put it there).
 
 The installer:
 - Backs up your existing `~/.claude/settings.json` before writing
-- Is idempotent — skips if the hooks are already wired to the same `server.py` path
+- Is idempotent — skips if the hooks are already wired to the `clexo` command (and
+  re-points an older `server.py`-based hook in place)
 - Does NOT touch any other hook entries you've added
 
 ## Verify hooks are working
