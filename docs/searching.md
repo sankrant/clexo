@@ -47,7 +47,25 @@ clexo search "deploy" --source_filter codex
 
 # Cap the number of results
 clexo search "deploy" --limit 3
+
+# Scope to the current working directory (sessions started here)
+clexo search "deploy" --pwd
+
+# …and override a configured pwd-default to search everywhere
+clexo search "deploy" --all
 ```
+
+`--pwd` matches the directory exactly (the cwd recorded when each session ran), so
+it's narrower than `--project_filter this`, which fuzzy-matches the project name. To
+make pwd-scoping the default for every search, set it in `~/.clexo/config.json`:
+
+```json
+{ "default_search_scope": "pwd" }
+```
+
+With that set, `clexo search` only looks in the current directory unless you pass
+`--all`. The MCP `search` tool takes the same scope via its `pwd` argument
+(`true`/`false`, or omit to follow the configured default).
 
 Flags can appear anywhere in the command — they're pulled out before the rest is
 joined into the FTS query, so `clexo search nginx config --source_filter codex`
@@ -55,29 +73,46 @@ searches for `nginx config` in Codex sessions. `--source`/`--project` are accept
 as shorthands, and `--flag=value` works too.
 
 The MCP tool accepts the same parameters: `search(query="...", project_filter="webapp",
-source_filter="claude")`.
+source_filter="claude", pwd=true)`.
 
 ## Output
 
 ```
-3 session(s) matching 'csrf':
+3 sessions · "csrf"
 
---- 1. 2026-04-22 [claude] | Users/alex/Code/webapp
-    Opening: csrf token error on /api/checkout
-    Last: shipped to staging, verified — closing
-    Match: [assistant] [Bash] curl -X POST ... → 403 forbidden (>>>csrf<<< token missing)
-    Session: 8f3a72b1-cd54-...
-    Resume: clexo resume 8f3a72b1-cd54-...   (full session · claude --resume)
-    Load:   clexo load 8f3a72b1-cd54-...   (compacted snapshot)
+1.  2026-04-22  claude  ~/Code/webapp                              8f3a72b1
+    open  csrf token error on /api/checkout
+    last  shipped to staging, verified — closing
+    hit   [Bash] curl -X POST ... → 403 forbidden («csrf» token missing)
+
+→ resume: clexo resume 8f3a72b1    load: clexo load 8f3a72b1
 ```
 
-Each result shows opening/closing lines, one match snippet, and two ways back into the
-session — both routed through `clexo` so you needn't remember the underlying CLI:
+Each result is a card: a header (number, date, source, project path, session id),
+the session's `open`ing and `last` user message, and the `hit` — the snippet that
+matched, with the term highlighted (bold in a terminal, «guillemets» when piped).
+When the match would just restate the opening line, the `hit` is omitted; use
+`--full` to always show it.
 
-- `clexo resume <id>` reopens the full session. The parenthetical shows the source-specific
-  command it dispatches to: `claude --resume` for Claude, `grok --resume` for Grok,
-  `codex resume` for Codex.
+Each header ends with a short 8-char id. That's a fragment, not the full UUID —
+but `clexo resume`/`load`/`show` resolve any unambiguous id prefix, so you pass
+the 8 chars straight through. One legend at the bottom shows both ways back,
+pre-filled with the **last** result's id so it's a runnable example:
+
+- `clexo resume <id>` reopens the full session, dispatching to `claude --resume`
+  (Claude), `grok --resume` (Grok), or `codex resume` (Codex).
 - `clexo load <id>` injects a compacted snapshot into a fresh session instead.
+
+Both route through `clexo` so you needn't remember the underlying CLI. `--full`
+prints the complete UUID in each header if you ever need the canonical id.
+
+### Layouts
+
+```bash
+clexo search "csrf"            # cards (default)
+clexo search "csrf" --oneline  # one aligned row per result (scan many fast)
+clexo search "csrf" --full     # open + last + every match snippet, full ids
+```
 
 If the summary isn't enough, `pick` drills into the same session for raw context.
 

@@ -613,12 +613,26 @@ _last_sync_ts: float = 0.0
 _SYNC_THROTTLE_SECONDS = 300  # 5-minute no-op window for opportunistic callers
 
 
+def _config_get(key, default=None):
+    """Read a single key from ~/.clexo/config.json, tolerating a missing or
+    malformed file (returns `default`)."""
+    try:
+        return json.loads((CLEXO_DIR / "config.json").read_text()).get(key, default)
+    except Exception:
+        return default
+
+
 def _debug_enabled() -> bool:
     """True if ~/.clexo/config.json has "debug": true. Used to gate verbose logging."""
-    try:
-        return bool(json.loads((CLEXO_DIR / "config.json").read_text()).get("debug"))
-    except Exception:
-        return False
+    return bool(_config_get("debug"))
+
+
+def _default_search_scope() -> str:
+    """Default scope for `clexo search`, from the `default_search_scope` config key:
+    'pwd' restricts to the current working directory unless --all is passed; anything
+    else (the default) searches every directory."""
+    val = str(_config_get("default_search_scope", "all") or "all").strip().lower()
+    return "pwd" if val == "pwd" else "all"
 
 
 def sync_all(conn: sqlite3.Connection = None, throttle: bool = False) -> int:
@@ -667,18 +681,6 @@ def _resume_argv(source: str, session_id: str) -> list[str]:
 def _resume_cmd(source: str, session_id: str) -> str:
     """Paste-ready full-resume command for a session, correct for its source."""
     return " ".join(_resume_argv(source, session_id))
-
-
-def _resume_footer(source: str, session_id: str, indent: str = "    ") -> list[str]:
-    """The two-line 'how to get back in' footer shown under a search result:
-    a full-resume via clexo (annotated with the source's own command) and a
-    compacted-snapshot load. Both route through clexo so the user needn't
-    remember the underlying CLI."""
-    underlying = " ".join(_resume_argv(source, session_id)[:-1])
-    return [
-        f"{indent}Resume: clexo resume {session_id}   (full session · {underlying})",
-        f"{indent}Load:   clexo load {session_id}   (compacted snapshot)",
-    ]
 
 
 # ── Centralized resume / load exec (the only places that launch a CLI) ────────
@@ -1030,16 +1032,36 @@ def _resolve_tag(name: str) -> str | None:
     return row[0] if row else None
 
 
+def _expand_id_prefix(prefix: str) -> str | None:
+    """Expand a session-id prefix (e.g. the 8-char id shown in search results) to
+    the full UUID when exactly one indexed session matches. Returns None if the
+    prefix is too short, matches nothing, or is ambiguous."""
+    p = prefix.lower().replace("-", "")
+    if len(p) < 8 or any(c not in "0123456789abcdef" for c in p):
+        return None
+    try:
+        rows = get_db().execute(
+            "SELECT session_id FROM sessions WHERE REPLACE(session_id,'-','') LIKE ? LIMIT 2",
+            [p + "%"],
+        ).fetchall()
+    except Exception:
+        return None
+    return rows[0][0] if len(rows) == 1 else None
+
+
 def _resolve_session_or_tag(name_or_uuid: str) -> str:
-    """Look up `name_or_uuid` as a tag. If found, return its session_id; otherwise
-    return the input unchanged (caller treats it as a UUID/raw id)."""
+    """Resolve `name_or_uuid` to a full session id. Tries, in order: a complete
+    UUID (passthrough), a known tag, then an unambiguous id prefix (the short id
+    printed in search results). Falls back to the input unchanged."""
     if not name_or_uuid:
         return name_or_uuid
     s = name_or_uuid.strip()
     if _TAG_UUID_RE.match(s.lower()):
         return s
     sid = _resolve_tag(s)
-    return sid if sid else s
+    if sid:
+        return sid
+    return _expand_id_prefix(s) or s
 
 
 def _create_tag(name: str, session_id: str = "", replace: bool = False) -> str:
@@ -1696,6 +1718,34 @@ def _resolve_project_filter(raw: str) -> str:
     return raw
 
 
+def _pwd_dir() -> str:
+    """The directory to scope --pwd to: the current session's recorded cwd
+    (env → DB) when available, else the shell's $PWD / os.getcwd(). Matches the
+    cwd stored verbatim at index time, so an exact `s.cwd = ?` compare works.
+    The DB lookup is what makes --pwd correct from the MCP server, whose own
+    process cwd may not be the user's project dir."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if sid:
+        try:
+            row = get_db().execute(
+                "SELECT cwd FROM sessions WHERE session_id=?", [sid]).fetchone()
+            if row and row[0]:
+                return row[0]
+        except Exception:
+            pass
+    return os.environ.get("PWD") or os.getcwd()
+
+
+def _pwd_scope(pwd) -> bool:
+    """Resolve the effective --pwd scope: an explicit True/False (from --pwd /
+    --all, or the MCP `pwd` arg) wins; None consults the configured default."""
+    if pwd is True:
+        return True
+    if pwd is False:
+        return False
+    return _default_search_scope() == "pwd"
+
+
 # ── FTS query helpers ────────────────────────────────────────────────────────
 
 def _relax_fts(query: str) -> str | None:
@@ -1712,12 +1762,257 @@ def _relax_fts(query: str) -> str | None:
 
 # ── Core search logic (shared by MCP tool and CLI) ────────────────────────────
 
+# ── Output formatting (TTY-aware; shared by search + recent listing) ──────────
+#
+# One render path serves both the human CLI and the MCP tool. Color is emitted
+# only for an interactive terminal (isatty); MCP and piped output stay plain so
+# the model / downstream tools see clean text and full session ids.
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+_RESET   = "\033[0m"
+# FTS snippet() highlight delimiters. Control chars (STX/ETX), not '>>>'/'<<<',
+# so they can't collide with literal '<'/'>' in content (XML tags, bash redirects).
+_HL_OPEN  = "\x02"
+_HL_CLOSE = "\x03"
+_STYLE   = {
+    "dim": "\033[2m", "bold": "\033[1m", "cyan": "\033[36m",
+    "yellow": "\033[33m", "green": "\033[32m", "magenta": "\033[35m",
+}
+_SRC_STYLE = {"claude": "magenta", "codex": "yellow", "grok": "green"}
+_HOME = str(Path.home())
+
+
+def _use_color() -> bool:
+    """Color only for an interactive terminal with NO_COLOR unset."""
+    try:
+        return bool(sys.stdout.isatty()) and not os.environ.get("NO_COLOR")
+    except Exception:
+        return False
+
+
+def _paint(text: str, *styles: str, on: bool = True) -> str:
+    if not on:
+        return text
+    pre = "".join(_STYLE[s] for s in styles if s in _STYLE)
+    return f"{pre}{text}{_RESET}" if pre else text
+
+
+def _term_width(default: int = 80) -> int:
+    try:
+        w = shutil.get_terminal_size((default, 20)).columns
+        return w if w and w >= 40 else default
+    except Exception:
+        return default
+
+
+def _vis_trunc(s: str, n: int) -> str:
+    """Truncate to n visible chars, treating ANSI escapes as zero-width. Appends
+    an ellipsis when cut and closes any open color so styling never bleeds.
+    Collapses internal whitespace first so a multi-line match (e.g. Bash output)
+    stays on one row."""
+    if n <= 0:
+        return ""
+    s = re.sub(r"[ \t\r\n\f\v]+", " ", s)
+    out, vis, i = [], 0, 0
+    while i < len(s):
+        m = _ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group()); i = m.end(); continue
+        if vis >= n:
+            break
+        out.append(s[i]); vis += 1; i += 1
+    res = "".join(out)
+    if i < len(s):
+        res = res.rstrip() + "…"
+    if "\033[" in res and not res.endswith(_RESET):
+        res += _RESET
+    return res
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def _short_path(cwd: str, project: str = "") -> str:
+    """Display path for a session. Prefer the real cwd (collapsing $HOME → ~);
+    fall back to the de-mangled project name only when cwd is unknown — that
+    fallback can't tell a real '/' from a '-' in the original directory name."""
+    p = (cwd or "").strip().rstrip("/")
+    if not p and project:
+        demangled = project.lstrip("-").replace("-", "/")
+        p = ("/" + demangled) if "/" in demangled else demangled
+    if not p:
+        return "?"
+    if p == _HOME:
+        return "~"
+    if p.startswith(_HOME + "/"):
+        return "~" + p[len(_HOME):]
+    return p
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").lower()).strip()
+
+
+def _match_core(entry: str) -> str:
+    """The match snippet's text, minus the [role] tag, FTS ellipses and the
+    highlight markers — used to detect overlap with opening/last."""
+    _, sep, body = entry.partition("] ")
+    if not sep:
+        body = entry
+    body = body.replace(_HL_OPEN, "").replace(_HL_CLOSE, "")
+    return body.strip().strip(".")
+
+
+def _match_redundant(entry: str, opening: str, last: str) -> bool:
+    """True when the top match just restates the opening/last line (the common
+    case where the query term lives in the first user message). Cards mode hides
+    it then; --full always shows it."""
+    core = _norm(_match_core(entry))
+    if len(core) < 12:
+        return False
+    for other in (_norm(opening), _norm(last)):
+        if other and (core in other or other in core):
+            return True
+    return False
+
+
+def _render_match(entry: str, color: bool, budget: int, show_role: bool = False) -> str:
+    """Render one match snippet: highlight the matched term (bold/yellow on a
+    TTY, «guillemets» otherwise) and truncate to `budget` visible chars."""
+    role, sep, body = entry.partition("] ")
+    if not sep:
+        role, body = "", entry
+    if color:
+        body = body.replace(_HL_OPEN, _STYLE["bold"] + _STYLE["yellow"]).replace(_HL_CLOSE, _RESET)
+    else:
+        body = body.replace(_HL_OPEN, "«").replace(_HL_CLOSE, "»")
+    if show_role and role:
+        body = _paint(role + "]", "dim", on=color) + " " + body
+    return _vis_trunc(body, budget)
+
+
+def _label(text: str, color: bool) -> str:
+    return _paint(f"{text:<5}", "dim", on=color)
+
+
+def _legend(color: bool, example_id: str) -> str:
+    """Bottom hint, made copy-paste-able by using the last result's 8-char id —
+    a fragment that `clexo resume`/`load` resolve to the full session."""
+    return _paint(f"→ resume: clexo resume {example_id}    load: clexo load {example_id}",
+                  "dim", on=color)
+
+
+def _clamp_path(path: str, maxlen: int) -> str:
+    if maxlen <= 1 or len(path) <= maxlen:
+        return path
+    return "…" + path[-(maxlen - 1):]
+
+
+def _card_header(h: dict, color: bool, width: int, full_id: bool = False) -> str:
+    """`N.  DATE  SRC  project ........... id` — id right-aligned to the terminal
+    width. Default shows the 8-char id (a fragment that `clexo resume`/`load`
+    resolve to the full session); --full prints the complete UUID. Color codes are
+    zero visible-width, so padding is computed from the plain tokens and stays
+    aligned whether or not color is on."""
+    n_str = f"{h['n']}."
+    date  = h["date"]
+    src   = f"{h['source']:<6}"
+    idv   = h["sid"] if full_id else h["sid"][:8]
+    prefix = f"{n_str:<3} {date}  {src}  "
+    path  = _clamp_path(h["path"], max(10, width - len(prefix) - len(idv) - 2))
+    left_plain = prefix + path
+    pad = max(2, width - len(left_plain) - len(idv))
+    return (_paint(f"{n_str:<3}", "bold", on=color) + f" {date}  " +
+            _paint(src, _SRC_STYLE.get(h["source"], ""), on=color) + "  " +
+            _paint(path, "cyan", on=color) + " " * pad +
+            _paint(idv, "dim", on=color))
+
+
+def _render_cards(hits: list, header: str, color: bool, mode: str) -> str:
+    width  = _term_width()
+    budget = max(20, width - 10)
+    out = [header, ""]
+    for h in hits:
+        out.append(_card_header(h, color, width, full_id=(mode == "full")))
+        if h.get("title"):
+            out.append("    " + _label("title", color) + " " +
+                       _vis_trunc(f'"{h["title"]}"', budget))
+        if h.get("opening"):
+            out.append("    " + _label("open", color) + " " + _vis_trunc(h["opening"], budget))
+        if h.get("last") and _norm(h["last"]) != _norm(h.get("opening") or ""):
+            out.append("    " + _label("last", color) + " " + _vis_trunc(h["last"], budget))
+        matches = h.get("matches") or []
+        if mode == "full":
+            for entry in matches[:2]:
+                out.append("    " + _label("hit", color) + " " +
+                           _render_match(entry, color, budget, show_role=True))
+        elif matches and not _match_redundant(matches[0], h.get("opening") or "", h.get("last") or ""):
+            out.append("    " + _label("hit", color) + " " +
+                       _render_match(matches[0], color, budget))
+        out.append("")
+    out.append(_legend(color, hits[-1]["sid"][:8]))
+    return "\n".join(out)
+
+
+def _render_oneline(hits: list, header: str, color: bool) -> str:
+    width = _term_width()
+    nw  = max(1, max(len(str(h["n"])) for h in hits))
+    pw  = min(24, max(len("PROJECT"), max(len(h["path"]) for h in hits)))
+    idw = 8
+    prefix_len = nw + 2 + 10 + 2 + 6 + 2 + pw + 2 + idw + 2
+    mbudget = max(16, width - prefix_len)
+    hdr = (f"{'#':<{nw}}  {'DATE':<10}  {'SRC':<6}  "
+           f"{'PROJECT':<{pw}}  {'ID':<{idw}}  MATCH")
+    out = [header, "", _paint(hdr, "dim", on=color)]
+    for h in hits:
+        idv   = h["sid"][:8]
+        path  = _clamp_path(h["path"], pw)
+        match = _render_match(h["matches"][0], color, mbudget) if h.get("matches") else ""
+        out.append(
+            _paint(f"{h['n']:<{nw}}", "bold", on=color) + f"  {h['date']:<10}  " +
+            _paint(f"{h['source']:<6}", _SRC_STYLE.get(h["source"], ""), on=color) + "  " +
+            _paint(f"{path:<{pw}}", "cyan", on=color) + "  " +
+            _paint(f"{idv:<{idw}}", "dim", on=color) + "  " + match)
+    out.append("")
+    out.append(_legend(color, hits[-1]["sid"][:8]))
+    return "\n".join(out)
+
+
+def _render_hits(hits: list, header: str, mode: str, color: bool) -> str:
+    if not hits:
+        return header
+    if mode == "oneline":
+        return _render_oneline(hits, header, color)
+    return _render_cards(hits, header, color, mode)
+
+
+def _build_hit(db, n: int, sid: str, ts: str, source: str, path: str,
+               thread_name: str, snippets: list) -> dict:
+    summary = _session_summary(db, sid)
+    return {
+        "n": n,
+        "date": ts[:10] if ts else "?",
+        "source": source,
+        "path": path,
+        "title": thread_name if source == "codex" else "",
+        "opening": summary[0] if summary else None,
+        "last": summary[-1] if len(summary) > 1 else None,
+        "matches": snippets,
+        "sid": sid,
+    }
+
+
 def _search(query: str, limit: int = 10, project_filter: str = "",
-            source_filter: str = "") -> str:
-    """Search indexed sessions. Returns formatted string result."""
+            source_filter: str = "", cwd_filter: str = "", mode: str = "cards") -> str:
+    """Search indexed sessions. Returns a formatted string. `mode` selects the
+    layout — 'cards' (default), 'full' (open+last+all matches), or 'oneline'.
+    `cwd_filter`, when set, restricts results to sessions whose working directory
+    is exactly that path (the --pwd scope)."""
     db = get_db()
     sync_all(db, throttle=True)
     _stat("search_calls", conn=db)
+    color = _use_color()
 
     # If query has no explicit FTS5 operators, quote it so special chars (. @ /) are safe
     _fts_ops = {"AND", "OR", "NOT"}
@@ -1734,12 +2029,15 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
     if source_filter:
         conditions.append("s.source = ?")
         params.append(source_filter)
+    if cwd_filter:
+        conditions.append("s.cwd = ?")
+        params.append(cwd_filter)
     where = " AND ".join(conditions)
 
     try:
         rows = db.execute(f"""
             SELECT m.session_id, m.project, m.role,
-                   snippet(messages, 3, '>>>', '<<<', '...', 20) AS snip, m.ts
+                   snippet(messages, 3, char(2), char(3), '...', 20) AS snip, m.ts
             FROM messages m
             JOIN sessions s ON s.session_id = m.session_id
             WHERE {where}
@@ -1748,8 +2046,10 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
     except Exception as e:
         return f"Search error: {e}"
 
+    scope = f" in {_short_path(cwd_filter)}" if cwd_filter else ""
     if not rows:
-        return f"No results for '{query}'"
+        widen = "  (use --all to search every directory)" if cwd_filter else ""
+        return f"No results for '{query}'{scope}.{widen}"
 
     seen: dict = {}
     for session_id, project, role, snip, ts in rows:
@@ -1760,45 +2060,31 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
             ).fetchone()
             source      = (sess[2] or "claude") if sess else "claude"
             thread_name = (sess[3] or "")       if sess else ""
+            cwd         = (sess[1] or "")       if sess else ""
             seen[session_id] = {
-                "project":     project.lstrip("-").replace("-", "/"),
-                "first_msg":   (sess[0] or "")[:120] if sess else "",
+                "path":        _short_path(cwd, project),
                 "source":      source,
                 "thread_name": thread_name,
                 "snippets":    [],
                 "ts":          ts,
             }
-        if session_id in seen:
-            seen[session_id]["snippets"].append(f"[{role}] {snip}")
+        seen[session_id]["snippets"].append(f"[{role}] {snip}")
 
-    if not seen:
-        return f"No results for '{query}' (after source filter)"
-
-    out = [f"Found {len(seen)} session(s) matching '{query}':\n"]
-    for i, (sid, info) in enumerate(seen.items(), 1):
-        date  = info["ts"][:10] if info["ts"] else "?"
-        badge = f"[{info['source']}]"
-        out.append(f"--- {i}. {date} {badge} | {info['project']}")
-        if info["source"] == "codex" and info["thread_name"]:
-            out.append(f"    Title: {info['thread_name']}")
-        summary = _session_summary(db, sid)
-        for j, line in enumerate(summary):
-            prefix = "Opening:" if j == 0 else ("Last:" if j == len(summary) - 1 else "→")
-            out.append(f"    {prefix} {line}")
-        for snip in info["snippets"][:2]:
-            out.append(f"    Match: {snip}")
-        out.append(f"    Session: {sid}")
-        out.extend(_resume_footer(info["source"], sid))
-        out.append("")
-    return "\n".join(out)
+    hits = [_build_hit(db, i, sid, info["ts"], info["source"], info["path"],
+                       info["thread_name"], info["snippets"])
+            for i, (sid, info) in enumerate(seen.items(), 1)]
+    header = f'{_plural(len(hits), "session")} · "{query}"{scope}'
+    return _render_hits(hits, header, mode, color)
 
 
 def _list_recent_sessions(limit: int = 10, project_filter: str = "",
-                          source_filter: str = "") -> str:
-    """List recent sessions newest-first, optionally narrowed by project/source.
-    Used when search is called with an empty query."""
+                          source_filter: str = "", cwd_filter: str = "",
+                          mode: str = "cards") -> str:
+    """List recent sessions newest-first, optionally narrowed by project / source
+    / working directory. Used when search is called with an empty query."""
     db = get_db()
     sync_all(db, throttle=True)
+    color = _use_color()
     conditions: list[str] = []
     params: list = []
     if project_filter:
@@ -1807,39 +2093,38 @@ def _list_recent_sessions(limit: int = 10, project_filter: str = "",
     if source_filter:
         conditions.append("source = ?")
         params.append(source_filter)
+    if cwd_filter:
+        conditions.append("cwd = ?")
+        params.append(cwd_filter)
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     rows = db.execute(f"""
-        SELECT session_id, project, first_user_msg, last_ts, source, thread_name
+        SELECT session_id, project, cwd, last_ts, source, thread_name
         FROM sessions {where}
         ORDER BY last_ts DESC LIMIT ?
     """, params + [limit]).fetchall()
+    scope = f" in {_short_path(cwd_filter)}" if cwd_filter else ""
     if not rows:
-        return "No sessions indexed yet."
-    out = [f"Recent {len(rows)} session(s):\n"]
-    for sid, project, first_msg, ts, src, thread_name in rows:
-        date = ts[:10] if ts else "?"
-        proj = project.lstrip("-").replace("-", "/")
-        src  = src or "claude"
-        out.append(f"{date} [{src}] | {proj}")
-        if src == "codex" and thread_name:
-            out.append(f"  Title: {thread_name}")
-        for j, line in enumerate(_session_summary(db, sid)):
-            out.append(f"  {'Opening:' if j == 0 else 'Last:'} {line}")
-        out.append(f"  Session: {sid}")
-        out.extend(_resume_footer(src, sid, indent="  "))
-        out.append("")
-    return "\n".join(out)
+        widen = "  (use --all to list every directory)" if cwd_filter else ""
+        return f"No sessions indexed yet{scope}.{widen}"
+    hits = [_build_hit(db, i, sid, ts, src or "claude",
+                       _short_path(cwd, project), thread_name, [])
+            for i, (sid, project, cwd, ts, src, thread_name) in enumerate(rows, 1)]
+    header = f'{_plural(len(hits), "recent session")}{scope}'
+    return _render_hits(hits, header, mode, color)
 
 
 def search_sessions(query: str = "", limit: int = 10, project_filter: str = "",
-                    source_filter: str = "") -> str:
+                    source_filter: str = "", pwd=None, mode: str = "cards") -> str:
     """Full-text search across the archive, or list recent sessions when the
-    query is empty. Resolves "this"/"cwd"/"." project aliases. Shared entry
-    point for the MCP `search` tool and the `clexo search` CLI."""
+    query is empty. Resolves "this"/"cwd"/"." project aliases and applies the
+    --pwd working-directory scope (`pwd` True/False overrides the configured
+    default). Shared entry point for the MCP `search` tool and `clexo search`."""
     pf = _resolve_project_filter(project_filter)
+    cwd_filter = _pwd_dir() if _pwd_scope(pwd) else ""
     if not query.strip():
-        return _list_recent_sessions(limit, pf, source_filter)
-    return _search(query, limit=limit, project_filter=pf, source_filter=source_filter)
+        return _list_recent_sessions(limit, pf, source_filter, cwd_filter, mode)
+    return _search(query, limit=limit, project_filter=pf,
+                   source_filter=source_filter, cwd_filter=cwd_filter, mode=mode)
 
 
 # Flags the `clexo search` CLI understands; each takes a value. The rest of the
@@ -1852,14 +2137,30 @@ _SEARCH_FLAGS = {
     "--limit":          "limit",
 }
 
+# Valueless flags: --pwd / --all scope to (or out of) the current directory;
+# --oneline / --full pick the result layout.
+_SEARCH_BOOL_FLAGS = {"--pwd", "--all", "--oneline", "--full"}
+
 def _parse_search_args(args: list[str]) -> tuple[str, dict]:
     """Split `clexo search` argv into (query, opts), pulling out --flags so they
     aren't swallowed into the FTS query."""
-    opts = {"source_filter": "", "project_filter": "", "limit": 10}
+    opts = {"source_filter": "", "project_filter": "", "limit": 10,
+            "pwd": None, "mode": "cards"}
     query: list[str] = []
     i = 0
     while i < len(args):
         a = args[i]
+        if a in _SEARCH_BOOL_FLAGS:
+            if a == "--pwd":
+                opts["pwd"] = True
+            elif a == "--all":
+                opts["pwd"] = False
+            elif a == "--oneline":
+                opts["mode"] = "oneline"
+            elif a == "--full":
+                opts["mode"] = "full"
+            i += 1
+            continue
         key = val = None
         if a.split("=", 1)[0] in _SEARCH_FLAGS and "=" in a:
             name, val = a.split("=", 1)
@@ -2130,7 +2431,7 @@ def _run_server():
 
     @app.tool()
     def search(query: str = "", limit: int = 10, project_filter: str = "",
-               source_filter: str = "") -> str:
+               source_filter: str = "", pwd: bool | None = None) -> str:
         """Full-text search across the indexed archive of all past Claude Code,
         Codex, and Grok Build sessions — every user message, assistant reply,
         and tool result. The broad entry point for any backward reference to
@@ -2160,12 +2461,16 @@ def _run_server():
             project_filter: Partial project path e.g. "myapp"; use "this"/"cwd"/"." for current project
             source_filter: "claude", "codex", or "grok" to restrict to sessions from one AI.
                            Use source_filter="grok" to search only Grok Build history.
+            pwd: Scope to the current working directory. None (default) follows the
+                 user's configured default; True restricts to sessions started in this
+                 directory; False searches every directory (override a pwd default).
         """
         return search_sessions(query, limit=limit, project_filter=project_filter,
-                                source_filter=source_filter)
+                                source_filter=source_filter, pwd=pwd)
 
     @app.tool()
-    def grok_search(query: str = "", limit: int = 10, project_filter: str = "") -> str:
+    def grok_search(query: str = "", limit: int = 10, project_filter: str = "",
+                    pwd: bool | None = None) -> str:
         """Convenience tool to search *only* Grok Build sessions.
 
         Equivalent to calling search() with source_filter="grok" hardcoded.
@@ -2181,7 +2486,7 @@ def _run_server():
         Then use load(session_id) or pick() for more details.
         """
         return search_sessions(query, limit=limit, project_filter=project_filter,
-                                source_filter="grok")
+                                source_filter="grok", pwd=pwd)
 
     def get_session_excerpt(
         session_id: str,
@@ -3225,7 +3530,8 @@ def _dispatch():
         # Empty query is valid — lists recent sessions (optionally filtered).
         print(search_sessions(query, limit=opts["limit"],
                               project_filter=opts["project_filter"],
-                              source_filter=opts["source_filter"]))
+                              source_filter=opts["source_filter"],
+                              pwd=opts["pwd"], mode=opts["mode"]))
     elif "--save" in sys.argv:
         idx = sys.argv.index("--save")
         arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
@@ -3374,6 +3680,8 @@ Commands:
   search [query]       Search chat history (empty lists recent)
                        [--source_filter claude|codex|grok]
                        [--project_filter <name>|this] [--limit N]
+                       [--pwd | --all]      Scope to / out of the current dir
+                       [--oneline | --full] Compact table / verbose layout
   save [sid|tag]       Snapshot current (or given) session for restore
 
 Tags:

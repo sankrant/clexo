@@ -40,7 +40,7 @@ def test_db_has_indexed_sessions():
 
 def test_search_returns_results():
     result = server._search("refresh")
-    assert "Found" in result or "No results" in result
+    assert "session" in result.lower() or "No results" in result
 
 
 def test_search_finds_known_term():
@@ -66,9 +66,68 @@ def test_search_special_chars_in_query():
     assert not result.startswith("Search error")
 
 
-def test_search_no_results():
+def test_search_no_results(tmp_path, monkeypatch):
+    # Isolate the DB and stop sync from re-indexing the live archive, so the
+    # query runs against a genuinely empty index (deterministic "No results").
+    monkeypatch.setattr(server, "DB_PATH", tmp_path / "empty.db")
+    monkeypatch.setattr(server, "sync_all", lambda *a, **k: 0)
+    server.get_db()
     result = server._search("xyzzy_no_such_term_qqqq")
     assert "No results" in result
+
+
+# ── Search output formatting + scope flags ────────────────────────────────────
+
+def test_search_modes_render_without_error():
+    for mode in ("cards", "full", "oneline"):
+        out = server._search("clexo", limit=2, mode=mode)
+        assert isinstance(out, str)
+        assert not out.startswith("Search error")
+
+
+def test_parse_search_args_pulls_bool_flags():
+    query, opts = server._parse_search_args(
+        ["nginx", "config", "--pwd", "--oneline", "--limit", "3"])
+    assert query == "nginx config"          # bool flags not swallowed into query
+    assert opts["pwd"] is True
+    assert opts["mode"] == "oneline"
+    assert opts["limit"] == 3
+
+
+def test_parse_search_args_all_and_full():
+    _, opts = server._parse_search_args(["q", "--all", "--full"])
+    assert opts["pwd"] is False
+    assert opts["mode"] == "full"
+
+
+def test_parse_search_args_defaults():
+    _, opts = server._parse_search_args(["q"])
+    assert opts["pwd"] is None and opts["mode"] == "cards"
+
+
+def test_pwd_scope_explicit_overrides_config(monkeypatch):
+    monkeypatch.setattr(server, "_default_search_scope", lambda: "pwd")
+    assert server._pwd_scope(False) is False        # --all beats a pwd default
+    assert server._pwd_scope(True) is True
+    monkeypatch.setattr(server, "_default_search_scope", lambda: "all")
+    assert server._pwd_scope(None) is False
+    monkeypatch.setattr(server, "_default_search_scope", lambda: "pwd")
+    assert server._pwd_scope(None) is True
+
+
+def test_short_path_collapses_home():
+    home = str(Path.home())
+    assert server._short_path(f"{home}/Code/en-IN") == "~/Code/en-IN"
+    assert server._short_path(home) == "~"
+    assert server._short_path("/var/tmp/x") == "/var/tmp/x"
+    # cwd missing → de-mangle the encoded project name as a fallback
+    assert server._short_path("", "-Users-foo-proj").startswith("/Users/foo/proj")
+
+
+def test_vis_trunc_single_line_and_ellipsis():
+    assert server._vis_trunc("a\nb\nc", 99) == "a b c"     # newlines collapsed
+    cut = server._vis_trunc("x" * 50, 10)
+    assert cut.endswith("…") and len(cut) == 11
 
 
 # ── Refresh load ──────────────────────────────────────────────────────────────
