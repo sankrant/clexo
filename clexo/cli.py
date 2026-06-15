@@ -2021,14 +2021,19 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
     else:
         fts_query = query
 
-    conditions = ["messages MATCH ?"]
-    params: list = [fts_query]
+    # Conditions sans cwd, so the same query can be counted across every
+    # directory when scoping is active (to tell the user what --all would add).
+    base_conditions = ["messages MATCH ?"]
+    base_params: list = [fts_query]
     if project_filter:
-        conditions.append("m.project LIKE ?")
-        params.append(f"%{project_filter}%")
+        base_conditions.append("m.project LIKE ?")
+        base_params.append(f"%{project_filter}%")
     if source_filter:
-        conditions.append("s.source = ?")
-        params.append(source_filter)
+        base_conditions.append("s.source = ?")
+        base_params.append(source_filter)
+
+    conditions = list(base_conditions)
+    params = list(base_params)
     if cwd_filter:
         conditions.append("s.cwd = ?")
         params.append(cwd_filter)
@@ -2046,8 +2051,28 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
     except Exception as e:
         return f"Search error: {e}"
 
+    # How many sessions in *other* directories match the same query — so a
+    # cwd-scoped search is never silently lossy. Only computed when scoping.
+    more_elsewhere = 0
+    if cwd_filter:
+        try:
+            total_all = db.execute(
+                f"SELECT COUNT(DISTINCT m.session_id) FROM messages m "
+                f"JOIN sessions s ON s.session_id = m.session_id "
+                f"WHERE {' AND '.join(base_conditions)}", base_params).fetchone()[0]
+            here = db.execute(
+                f"SELECT COUNT(DISTINCT m.session_id) FROM messages m "
+                f"JOIN sessions s ON s.session_id = m.session_id "
+                f"WHERE {where}", params).fetchone()[0]
+            more_elsewhere = max(0, (total_all or 0) - (here or 0))
+        except Exception:
+            more_elsewhere = 0
+
     scope = f" in {_short_path(cwd_filter)}" if cwd_filter else ""
     if not rows:
+        if cwd_filter and more_elsewhere:
+            return (f"No results for '{query}'{scope} — but {more_elsewhere} "
+                    f"in other directories. Use --all to search everywhere.")
         widen = "  (use --all to search every directory)" if cwd_filter else ""
         return f"No results for '{query}'{scope}.{widen}"
 
@@ -2074,7 +2099,14 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
                        info["thread_name"], info["snippets"])
             for i, (sid, info) in enumerate(seen.items(), 1)]
     header = f'{_plural(len(hits), "session")} · "{query}"{scope}'
-    return _render_hits(hits, header, mode, color)
+    out = _render_hits(hits, header, mode, color)
+    if cwd_filter:
+        if more_elsewhere:
+            out += (f"\n\n+{more_elsewhere} more in other directories · "
+                    f"use --all to include them")
+        else:
+            out += "\n\nscoped to this directory · use --all to search everywhere"
+    return out
 
 
 def _list_recent_sessions(limit: int = 10, project_filter: str = "",
@@ -2110,7 +2142,10 @@ def _list_recent_sessions(limit: int = 10, project_filter: str = "",
                        _short_path(cwd, project), thread_name, [])
             for i, (sid, project, cwd, ts, src, thread_name) in enumerate(rows, 1)]
     header = f'{_plural(len(hits), "recent session")}{scope}'
-    return _render_hits(hits, header, mode, color)
+    out = _render_hits(hits, header, mode, color)
+    if cwd_filter:
+        out += "\n\nscoped to this directory · use --all to list every directory"
+    return out
 
 
 def search_sessions(query: str = "", limit: int = 10, project_filter: str = "",
@@ -2410,8 +2445,9 @@ def _run_server():
             "Do NOT grep ~/.codex/sessions or ~/.claude/projects directly — "
             "clexo is the indexed entry point for that archive.\n\n"
             "Tools:\n"
-            "  search  — find which session (FTS5; supports project_filter "
-            "and source_filter='claude'|'codex'; empty query lists recent)\n"
+            "  search  — find which session (FTS5; supports project_filter, "
+            "source_filter='claude'|'codex', and pwd=true/false to scope to the "
+            "current directory; empty query lists recent)\n"
             "  load    — pull a session's summary + recent exchanges into "
             "current context, and mark it as the next-session restore point\n"
             "  pick    — drill into raw exchanges/tool outputs within a "
@@ -2461,9 +2497,11 @@ def _run_server():
             project_filter: Partial project path e.g. "myapp"; use "this"/"cwd"/"." for current project
             source_filter: "claude", "codex", or "grok" to restrict to sessions from one AI.
                            Use source_filter="grok" to search only Grok Build history.
-            pwd: Scope to the current working directory. None (default) follows the
-                 user's configured default; True restricts to sessions started in this
-                 directory; False searches every directory (override a pwd default).
+            pwd: Working-directory scope. None (default) follows the user's
+                 configured default; True restricts to sessions started in the
+                 current directory; False searches every directory. If a result
+                 says "+N more in other directories · use --all", that is the CLI
+                 hint — call search again with pwd=False to widen across all dirs.
         """
         return search_sessions(query, limit=limit, project_filter=project_filter,
                                 source_filter=source_filter, pwd=pwd)

@@ -67,6 +67,20 @@ With that set, `clexo search` only looks in the current directory unless you pas
 `--all`. The MCP `search` tool takes the same scope via its `pwd` argument
 (`true`/`false`, or omit to follow the configured default).
 
+Whenever a search is directory-scoped, the result is never silently lossy — it tells
+you how much you're not seeing and how to widen:
+
+```
+1 session · "nginx" in ~/Code/clexo
+...
++2 more in other directories · use --all to include them
+```
+
+If the cwd has no match but other directories do, the "no results" line says so:
+`No results for 'nginx' in ~/Code/clexo — but 2 in other directories. Use --all to
+search everywhere.` (In the MCP tool, "use --all" means call `search` again with
+`pwd=false`.)
+
 Flags can appear anywhere in the command — they're pulled out before the rest is
 joined into the FTS query, so `clexo search nginx config --source_filter codex`
 searches for `nginx config` in Codex sessions. `--source`/`--project` are accepted
