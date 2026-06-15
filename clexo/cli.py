@@ -3002,6 +3002,19 @@ def _pack_compact(content: str, cap: int, footer: str = "") -> dict:
     }
 
 
+def _same_session_dir(a: str, b: str) -> bool:
+    """True if two recorded working directories refer to the same project dir.
+
+    Used by the SessionStart auto-restore guard: a pending snapshot only
+    auto-injects when the new session starts in the directory the saved
+    session ran in. Normalises trailing slashes and `~`, but — like `--pwd`
+    — compares the path otherwise verbatim (no symlink resolution), since the
+    cwd is stored exactly as Claude recorded it at index time."""
+    def _norm(p: str) -> str:
+        return os.path.normpath(os.path.expanduser((p or "").strip()))
+    return _norm(a) == _norm(b)
+
+
 def _session_start_hook() -> None:
     """Output SessionStart hook JSON by delegating to _refresh_load.
 
@@ -3020,15 +3033,61 @@ def _session_start_hook() -> None:
     # Peek at pending before _refresh_load clears it — needed for chain handoff
     loaded_sid = REFRESH_PENDING.read_text().strip()
 
-    # New session id from hook stdin payload (Claude Code passes session_id).
+    # New session id + cwd from hook stdin payload (Claude Code passes both).
     new_sid = ""
+    new_cwd = ""
     try:
         if not sys.stdin.isatty():
             raw = sys.stdin.read()
             if raw.strip():
-                new_sid = (json.loads(raw).get("session_id") or "").strip()
+                payload = json.loads(raw)
+                new_sid = (payload.get("session_id") or "").strip()
+                new_cwd = (payload.get("cwd") or "").strip()
     except Exception:
-        new_sid = ""
+        new_sid = new_cwd = ""
+    # Fall back to the hook process cwd (Claude runs hooks in the project dir).
+    if not new_cwd:
+        new_cwd = os.environ.get("PWD") or os.getcwd()
+
+    # Directory safeguard: only auto-restore when the new session starts in the
+    # same directory the saved session ran in. Without this, a pending snapshot
+    # from project A would bleed into an unrelated project B the next time any
+    # session starts. The marker is left in place so resuming from the right
+    # directory still works. Fails open when either cwd is unknown, or when the
+    # guard is disabled via "autoload_cwd_guard": false in config.json.
+    if loaded_sid and new_cwd and _config_get("autoload_cwd_guard", True):
+        try:
+            row = get_db().execute(
+                "SELECT cwd FROM sessions WHERE session_id = ?", [loaded_sid]
+            ).fetchone()
+            saved_cwd = (row[0] if row and row[0] else "") or ""
+        except Exception:
+            saved_cwd = ""
+        if saved_cwd and not _same_session_dir(new_cwd, saved_cwd):
+            # Different project — defer the restore, don't inject here. Drop any
+            # chain-handoff pointer so a save() in this session starts its own
+            # chain rather than extending the deferred one.
+            _CHAIN_LOADED.unlink(missing_ok=True)
+            home = os.path.expanduser("~")
+            saved_disp = saved_cwd.replace(home, "~", 1)
+            here_disp  = new_cwd.replace(home, "~", 1)
+            msg = (
+                "↺  Clexo · Auto-restore deferred — saved session ran in a "
+                "different directory.\n"
+                f"     saved: {saved_disp}\n"
+                f"     here:  {here_disp}\n"
+                "     Start a session there, or run  clexo load <tag>  to "
+                "restore it here."
+            )
+            if _debug_enabled():
+                with open(CLEXO_DIR / "hook.log", "a") as _lf:
+                    _lf.write(
+                        f"\n--- {datetime.datetime.now().isoformat()} ---\n"
+                        f"MODE: cwd-guard skip "
+                        f"(saved={saved_cwd!r} new={new_cwd!r})\n"
+                    )
+            print(json.dumps({"systemMessage": msg}))
+            return
 
     content = _refresh_load()
 

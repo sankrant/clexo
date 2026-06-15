@@ -11,6 +11,16 @@ Claude Code's `additionalContext` budget (~10 KB), and injects it into the new s
 **Effect:** after `!clexo save` and `/clear`, your next session is already restored.
 No manual `clexo load` needed.
 
+**Directory safeguard:** the snapshot only auto-injects when the new session
+starts in the **same directory** the saved session ran in. If you save in project
+A and the next session starts in an unrelated project B, the restore is *deferred*
+rather than injected — you'll see a short "Auto-restore deferred" note instead of
+project A's context. The pending snapshot is kept, so starting a session back in
+project A still restores it (or run `clexo load <tag>` to pull it in anywhere).
+
+Disable the safeguard with `"autoload_cwd_guard": false` in `~/.clexo/config.json`
+to always inject the pending snapshot regardless of directory.
+
 **Command it runs:** `clexo session-start`
 
 ## SessionEnd — keep the index fresh

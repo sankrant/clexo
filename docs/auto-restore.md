@@ -22,6 +22,17 @@ The headline workflow. End-to-end:
 The result: your session continues seamlessly with summary + memory preserved, but
 without the full multi-megabyte transcript weighing down the context window.
 
+## Same-directory safeguard
+
+Auto-restore only fires when the new session starts in the **same directory** as the
+saved one. Save in one project, then start your next session in an unrelated project,
+and the snapshot is *deferred* (you get a brief "Auto-restore deferred" note) instead
+of bleeding the first project's context into the second. The pending snapshot stays
+put — go back to the original directory and it restores, or run `clexo load <tag>` to
+pull it in from anywhere.
+
+To turn the safeguard off, set `"autoload_cwd_guard": false` in `~/.clexo/config.json`.
+
 ## What you give up vs. `claude --resume`
 
 `claude --resume <uuid>` re-loads the **entire** session — every message, every tool

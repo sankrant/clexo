@@ -1,5 +1,7 @@
 """Core tests for clexo server functions."""
+import io
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -227,6 +229,90 @@ def test_session_start_hook_with_pending(tmp_path, monkeypatch, capsys):
     assert "2026-05-06" in data["systemMessage"]
     assert "hook test session" in data["systemMessage"]
     assert "Previous session context" in data["hookSpecificOutput"]["additionalContext"]
+
+
+# ── Session start cwd guard ───────────────────────────────────────────────────
+
+def test_same_session_dir():
+    f = server._same_session_dir
+    assert f("/a/b/c", "/a/b/c") is True
+    assert f("/a/b/c/", "/a/b/c") is True              # trailing slash
+    assert f("~/x", os.path.expanduser("~/x")) is True  # ~ expansion
+    assert f("/a/b/c", "/a/b/d") is False
+    assert f("/a/b/c/sub", "/a/b/c") is False           # subdir is a different dir
+    assert f("", "/a") is False
+
+
+def _feed_hook_stdin(monkeypatch, session_id="new-sid", cwd=None, source="clear"):
+    """Replace sys.stdin with a fake (non-tty) SessionStart hook payload."""
+    payload = {"session_id": session_id, "source": source}
+    if cwd is not None:
+        payload["cwd"] = cwd
+    monkeypatch.setattr(server.sys, "stdin", io.StringIO(json.dumps(payload)))
+
+
+def _seed_pending_chain(tmp_path, sid, saved_cwd):
+    """Index a session with a cwd, write its chain snapshot, mark it pending."""
+    db = server.get_db()
+    db.execute(
+        "INSERT INTO sessions(session_id, project, cwd, source) VALUES(?,?,?,'claude')",
+        [sid, "proj", saved_cwd],
+    )
+    db.commit()
+    (tmp_path / f"chain-{sid}.md").write_text(
+        f"## Session {sid} | 2026-06-15 10:00 IST | claude | proj\n\n"
+        "### Summary\n- guard test session\n\n"
+        "### Key files\n(none)\n\n"
+        "### Recent exchanges\n[USER] 2026-06-15\nhi\n\n[ASSISTANT] 2026-06-15\nhello\n"
+    )
+    (tmp_path / "refresh-pending").write_text(sid)
+
+
+def test_session_start_hook_cwd_guard_defers_on_mismatch(tmp_path, monkeypatch, capsys):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "aaaaaaaa-1111-2222-3333-444444444444"
+    _seed_pending_chain(tmp_path, sid, "/Users/me/Code/projA")
+    _feed_hook_stdin(monkeypatch, cwd="/Users/me/Code/projB")
+    server._session_start_hook()
+    data = json.loads(capsys.readouterr().out)
+    # No context injected; helpful note shown; pending marker preserved.
+    assert "hookSpecificOutput" not in data
+    assert "deferred" in data["systemMessage"]
+    assert (tmp_path / "refresh-pending").exists()
+
+
+def test_session_start_hook_cwd_guard_allows_same_dir(tmp_path, monkeypatch, capsys):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "bbbbbbbb-1111-2222-3333-444444444444"
+    _seed_pending_chain(tmp_path, sid, "/Users/me/Code/projA")
+    _feed_hook_stdin(monkeypatch, cwd="/Users/me/Code/projA/")  # trailing slash still matches
+    server._session_start_hook()
+    data = json.loads(capsys.readouterr().out)
+    assert "Previous session context" in data["hookSpecificOutput"]["additionalContext"]
+    assert not (tmp_path / "refresh-pending").exists()
+
+
+def test_session_start_hook_cwd_guard_disabled_via_config(tmp_path, monkeypatch, capsys):
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "cccccccc-1111-2222-3333-444444444444"
+    _seed_pending_chain(tmp_path, sid, "/Users/me/Code/projA")
+    (tmp_path / "config.json").write_text(json.dumps({"autoload_cwd_guard": False}))
+    _feed_hook_stdin(monkeypatch, cwd="/Users/me/Code/projB")  # different dir
+    server._session_start_hook()
+    data = json.loads(capsys.readouterr().out)
+    assert "hookSpecificOutput" in data                 # restored despite mismatch
+    assert not (tmp_path / "refresh-pending").exists()
+
+
+def test_session_start_hook_cwd_guard_fails_open_when_cwd_unindexed(tmp_path, monkeypatch, capsys):
+    # Saved session has no recorded cwd → guard can't compare → restore proceeds.
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "dddddddd-1111-2222-3333-444444444444"
+    _seed_pending_chain(tmp_path, sid, "")  # empty cwd
+    _feed_hook_stdin(monkeypatch, cwd="/Users/me/Code/anywhere")
+    server._session_start_hook()
+    data = json.loads(capsys.readouterr().out)
+    assert "hookSpecificOutput" in data
 
 
 # ── Tags ──────────────────────────────────────────────────────────────────────
