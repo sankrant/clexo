@@ -144,6 +144,8 @@ clexo stats                          Show usage stats
 clexo sync                           Index new messages now
 clexo search <query>                 Search chat history
 clexo save [sid|tag]                 Snapshot the current (or given) session
+clexo saved [--short]                List saved snapshots, newest first, with the
+                                     id fragment to reload each
 
 clexo tag <name> [--force] [sid]     Tag the current (or given) session
 clexo tags [--short|--keywords]      List tags, newest first (--short: name+date)

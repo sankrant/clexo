@@ -24,14 +24,19 @@ without the full multi-megabyte transcript weighing down the context window.
 
 ## Same-directory safeguard
 
-Auto-restore only fires when the new session starts in the **same directory** as the
-saved one. Save in one project, then start your next session in an unrelated project,
-and the snapshot is *deferred* (you get a brief "Auto-restore deferred" note) instead
-of bleeding the first project's context into the second. The pending snapshot stays
-put — go back to the original directory and it restores, or run `clexo load <tag>` to
-pull it in from anywhere.
+The *automatic* restore only fires when the new session starts in the **same directory**
+as the saved one. Save in one project, then start your next session in an unrelated
+project, and the snapshot is *deferred* (you get a brief "Auto-restore deferred" note)
+instead of bleeding the first project's context into the second. The pending snapshot
+stays put — go back to the original directory and it restores.
 
-To turn the safeguard off, set `"autoload_cwd_guard": false` in `~/.clexo/config.json`.
+This guard applies only to the *automatic* restore. When you explicitly run
+`clexo load <fragment-or-tag>`, that's a deliberate choice, so it always loads — even in
+a different directory. The banner then notes the directory it came from
+(`↳ from ~/Code/projA (loaded here)`) so the cross-directory continuation is visible.
+
+To turn the guard off for automatic restores too, set `"autoload_cwd_guard": false` in
+`~/.clexo/config.json`.
 
 ## What you give up vs. `claude --resume`
 

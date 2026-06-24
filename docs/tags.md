@@ -22,31 +22,35 @@ clexo pick "csrf token" \              # drill into a tagged session
 Tag names: `[a-z0-9_-]`, lowercase. Anything that looks like a UUID is rejected (to keep
 tag-or-uuid resolution unambiguous).
 
-## Auto-tags
+## On-demand tag names
 
-The first time you `clexo save` an untagged session, clexo generates a tag from the
-session's title (Claude's AI-set thread name) or first user message, prefixed with the
-project directory name. Example:
+`clexo save` does **not** create a tag. A saved snapshot is reachable by its session-id
+fragment, which `save` prints for you:
 
 ```
 $ clexo save
 Wrote snapshot: 14,961 chars ≈ 3.7K tokens
 Compacted from ~205K msg tokens (98% smaller)
-Tagged 'clexo-improve-gain'
+Reload later: clexo load 8f3a72b1
 Run /clear — snapshot auto-restores on next message.
 ```
 
-The same logic powers bare `clexo tag` — running it on an untagged session creates the
-auto-tag; on an already-tagged session, it just prints the existing tag plus the two
-commands to act on it (`clexo resume <tag>` or `clexo load <tag>`).
+Tag a session only when you want a memorable name — `clexo tag <name>`, or bare
+`clexo tag` to have one generated from the session's title (Claude's AI-set thread name)
+or first user message, prefixed with the project directory name. On an already-tagged
+session, bare `clexo tag` just prints the existing tag plus the two commands to act on it
+(`clexo resume <tag>` or `clexo load <tag>`).
 
-Stop words (`how`, `what`, `please`, articles, pronouns, …) are stripped; the first
-three content words are joined into the topic; the project prefix is dropped if it
-already appears as a topic word. On name collisions a numeric suffix is appended
-(`-2`, `-3`, …) until a free slot is found.
+For the generated name: stop words (`how`, `what`, `please`, articles, pronouns, …) are
+stripped; the first three content words are joined into the topic; the project prefix is
+dropped if it already appears as a topic word. On name collisions a numeric suffix is
+appended (`-2`, `-3`, …) until a free slot is found.
 
-Auto-tags are indistinguishable from manual tags once created — same table, same
-commands. Rename or remove them like any other tag.
+Generated tags are indistinguishable from hand-picked ones — same table, same commands.
+Rename or remove them like any other tag.
+
+To list snapshots you've saved (tagged or not), see `clexo saved` in
+[snapshots.md](snapshots.md#listing-saved-snapshots).
 
 ## How `load <name>` resolves
 

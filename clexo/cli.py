@@ -38,6 +38,7 @@ CODEX_SESSIONS     = Path.home() / ".codex" / "sessions"
 CODEX_SESSION_IDX  = Path.home() / ".codex" / "session_index.jsonl"
 GROK_SESSIONS      = Path.home() / ".grok" / "sessions"
 REFRESH_PENDING    = CLEXO_DIR / "refresh-pending"
+REFRESH_EXPLICIT   = CLEXO_DIR / "refresh-explicit"  # marks a user-requested load (bypasses the cwd guard once)
 
 _UUID_RE      = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 _CHAIN_RE     = re.compile(r'^## Session ([a-f0-9-]{36})', re.MULTILINE)
@@ -707,6 +708,10 @@ def _exec_load(session_id: str, source: str = "claude", allow_print: bool = True
         print(err, file=sys.stderr)
         sys.exit(1)
     REFRESH_PENDING.write_text(session_id)
+    # User ran `clexo load` deliberately — let the SessionStart hook restore it
+    # even when the fresh session starts in a different directory than the saved
+    # one. The same-directory safeguard only applies to automatic restores.
+    REFRESH_EXPLICIT.write_text(session_id)
     binary = _resume_binary(source or "claude")
     if sys.stdout.isatty():
         os.execvp(binary, [binary])
@@ -1279,6 +1284,73 @@ def _format_tags(short: bool = False, keywords: bool = False) -> str:
                                         n_sessions=n_sessions)
                 if kws:
                     out.append(f"    Keywords: {', '.join(kws)}")
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
+def _format_saved(short: bool = False) -> str:
+    """List sessions that have a saved clexo snapshot (chain-/refresh- files in
+    ~/.clexo), newest snapshot first. These are reachable via
+    `clexo load <fragment>` even when untagged."""
+    snaps: dict = {}  # sid -> newest snapshot mtime
+    for pat in ("chain-*.md", "refresh-*.md"):
+        for f in CLEXO_DIR.glob(pat):
+            # filenames are chain-<uuid>.md / refresh-<uuid>.md (split once: the
+            # uuid itself contains hyphens). Skip control files like
+            # chain-loaded / refresh-pending (no .md, won't match the glob).
+            sid = f.stem.split("-", 1)[1] if "-" in f.stem else ""
+            if not _TAG_UUID_RE.match(sid.lower()):
+                continue
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if sid not in snaps or mtime > snaps[sid]:
+                snaps[sid] = mtime
+    if not snaps:
+        return "No saved snapshots yet. Run `clexo save` (or save()) to create one."
+
+    db = get_db()
+    ordered = sorted(snaps.items(), key=lambda kv: kv[1], reverse=True)
+
+    tag_map: dict = {}
+    for tag, sid in db.execute("SELECT tag, session_id FROM tags").fetchall():
+        tag_map.setdefault(sid, []).append(tag)
+
+    def _meta(sid: str, mtime: float):
+        row = db.execute(
+            "SELECT COALESCE(source,'claude'), project, last_ts "
+            "FROM sessions WHERE session_id=?", [sid]
+        ).fetchone()
+        src  = (row[0] if row else "claude") or "claude"
+        proj = ((row[1] if row else "") or "").lstrip("-").replace("-", "/")
+        # Prefer the indexed last-activity date; fall back to when the snapshot
+        # file was written so older/unindexed sessions still show a date.
+        last = ((row[2] if row else "") or "")[:10]
+        if not last:
+            last = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+        return src, proj, last
+
+    if short:
+        out = [f"{len(ordered)} saved snapshot(s):\n"]
+        for sid, m in ordered:
+            _src, proj, last = _meta(sid, m)
+            tags = tag_map.get(sid, [])
+            tagstr = ("  " + " ".join(f"@{t}" for t in tags)) if tags else ""
+            out.append(f"{sid[:8]}  {last}  {proj or '?'}{tagstr}")
+        return "\n".join(out)
+
+    out = [f"{len(ordered)} saved snapshot(s):\n"]
+    for sid, m in ordered:
+        src, proj, last = _meta(sid, m)
+        frag = sid[:8]
+        tags = tag_map.get(sid, [])
+        tagstr = ("  " + " ".join(f"@{t}" for t in tags)) if tags else ""
+        out.append(f"{frag}  [{src}] {proj or '?'}  (last: {last}){tagstr}")
+        for j, line in enumerate(_session_summary(db, sid)):
+            prefix = "Opening:" if j == 0 else "Last:"
+            out.append(f"    {prefix} {line}")
+        out.append(f"    clexo load {frag}")
         out.append("")
     return "\n".join(out).rstrip()
 
@@ -2414,17 +2486,13 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
     except Exception:
         pass
 
-    try:
-        auto_tag = _apply_auto_tag(session_id, db)
-    except Exception:
-        auto_tag = None
-
     lines = [f"Wrote snapshot: {total_chars:,} chars ≈ {_human_count(snap_tok)} tokens"]
     if src_tok > snap_tok and src_tok > 0:
         pct = round((1 - snap_tok / src_tok) * 100)
         lines.append(f"Compacted from ~{_human_count(src_tok)} prefix tokens ({pct}% smaller)")
-    if auto_tag:
-        lines.append(f"Tagged '{auto_tag}'")
+    # No auto-tag — a snapshot is reachable by its id fragment; surface it for
+    # manual reload. `clexo tag <name>` is available if a friendly name is wanted.
+    lines.append(f"Reload later: clexo load {session_id[:8]}")
     lines.append("Run /clear — snapshot auto-restores on next message.")
     return "\n".join(lines)
 
@@ -2695,6 +2763,9 @@ def _run_server():
         result = _refresh_load(session_id)
         if "## Session" in result or "# Refresh Context" in result:
             REFRESH_PENDING.write_text(session_id)
+            # Deliberate load — the next session start should restore it even
+            # from a different directory (see the cwd guard in the hook).
+            REFRESH_EXPLICIT.write_text(session_id)
             _loaded_session_id = session_id
             _stat("refresh_loads", conn=db)
         return result
@@ -2708,9 +2779,9 @@ def _run_server():
         pending restore. The next time a new session starts, the SessionStart
         hook auto-loads this snapshot.
 
-        On the first save of a previously untagged session, also generates an
-        auto-tag (e.g. `project-topic-words`) so the snapshot is reachable by a
-        memorable name without copying the UUID.
+        The snapshot is reachable later by its session-id fragment
+        (`clexo load <fragment>`); the return value surfaces it. Use tag() if
+        the user wants a friendly name — snapshots are no longer auto-tagged.
 
         Use when the user asks to save ("save this session", "save"), is about
         to clear context, or context is getting long enough to warrant a
@@ -3033,6 +3104,19 @@ def _session_start_hook() -> None:
     # Peek at pending before _refresh_load clears it — needed for chain handoff
     loaded_sid = REFRESH_PENDING.read_text().strip()
 
+    # An explicit `clexo load` / load() drops this marker so this restore
+    # bypasses the same-directory guard below. Consume it once: a later
+    # automatic restore must re-earn the guard.
+    explicit_sid = ""
+    if REFRESH_EXPLICIT.exists():
+        try:
+            explicit_sid = REFRESH_EXPLICIT.read_text().strip()
+        except Exception:
+            explicit_sid = ""
+        REFRESH_EXPLICIT.unlink(missing_ok=True)
+    is_explicit = bool(explicit_sid) and explicit_sid == loaded_sid
+    cross_dir_note = None  # (saved_disp, here_disp) when an explicit load crosses dirs
+
     # New session id + cwd from hook stdin payload (Claude Code passes both).
     new_sid = ""
     new_cwd = ""
@@ -3064,30 +3148,42 @@ def _session_start_hook() -> None:
         except Exception:
             saved_cwd = ""
         if saved_cwd and not _same_session_dir(new_cwd, saved_cwd):
-            # Different project — defer the restore, don't inject here. Drop any
-            # chain-handoff pointer so a save() in this session starts its own
-            # chain rather than extending the deferred one.
-            _CHAIN_LOADED.unlink(missing_ok=True)
             home = os.path.expanduser("~")
             saved_disp = saved_cwd.replace(home, "~", 1)
             here_disp  = new_cwd.replace(home, "~", 1)
-            msg = (
-                "↺  Clexo · Auto-restore deferred — saved session ran in a "
-                "different directory.\n"
-                f"     saved: {saved_disp}\n"
-                f"     here:  {here_disp}\n"
-                "     Start a session there, or run  clexo load <tag>  to "
-                "restore it here."
-            )
-            if _debug_enabled():
-                with open(CLEXO_DIR / "hook.log", "a") as _lf:
-                    _lf.write(
-                        f"\n--- {datetime.datetime.now().isoformat()} ---\n"
-                        f"MODE: cwd-guard skip "
-                        f"(saved={saved_cwd!r} new={new_cwd!r})\n"
-                    )
-            print(json.dumps({"systemMessage": msg}))
-            return
+            if is_explicit:
+                # User asked for this load — honor it here, but note that the
+                # session is being continued in a different directory.
+                cross_dir_note = (saved_disp, here_disp)
+                if _debug_enabled():
+                    with open(CLEXO_DIR / "hook.log", "a") as _lf:
+                        _lf.write(
+                            f"\n--- {datetime.datetime.now().isoformat()} ---\n"
+                            f"MODE: cwd-guard bypass (explicit load) "
+                            f"(saved={saved_cwd!r} new={new_cwd!r})\n"
+                        )
+            else:
+                # Different project — defer the restore, don't inject here. Drop
+                # any chain-handoff pointer so a save() in this session starts
+                # its own chain rather than extending the deferred one.
+                _CHAIN_LOADED.unlink(missing_ok=True)
+                msg = (
+                    "↺  Clexo · Auto-restore deferred — saved session ran in a "
+                    "different directory.\n"
+                    f"     saved: {saved_disp}\n"
+                    f"     here:  {here_disp}\n"
+                    "     Start a session there, or run  clexo load <tag>  to "
+                    "restore it here."
+                )
+                if _debug_enabled():
+                    with open(CLEXO_DIR / "hook.log", "a") as _lf:
+                        _lf.write(
+                            f"\n--- {datetime.datetime.now().isoformat()} ---\n"
+                            f"MODE: cwd-guard skip "
+                            f"(saved={saved_cwd!r} new={new_cwd!r})\n"
+                        )
+                print(json.dumps({"systemMessage": msg}))
+                return
 
     content = _refresh_load()
 
@@ -3213,7 +3309,10 @@ def _session_start_hook() -> None:
     line1 = f"  ↺  Clexo · Session restored · {date}" if date else "  ↺  Clexo · Session restored"
     line2 = f"     {summary}" if summary else None
     line3 = f"     {stats}"
-    candidates = [line1, line3] + ([line2] if line2 else [])
+    # When an explicit load is continued in a different directory, note the
+    # original so the cross-directory restore is visible rather than silent.
+    line4 = f"     ↳ from {cross_dir_note[0]} (loaded here)" if cross_dir_note else None
+    candidates = [line1, line3] + ([line2] if line2 else []) + ([line4] if line4 else [])
     inner_w = max(len(s) for s in candidates) + 2
     rows = [
         "╔" + "═" * inner_w + "╗",
@@ -3222,6 +3321,8 @@ def _session_start_hook() -> None:
     if line2:
         rows.append("║" + line2 + " " * (inner_w - len(line2)) + "║")
     rows.append("║" + line3 + " " * (inner_w - len(line3)) + "║")
+    if line4:
+        rows.append("║" + line4 + " " * (inner_w - len(line4)) + "║")
     rows.append("╚" + "═" * inner_w + "╝")
     banner = "\n".join(rows)
 
@@ -3699,6 +3800,8 @@ def _dispatch():
     elif "--tags" in sys.argv:
         print(_format_tags(short="--short" in sys.argv,
                            keywords="--keywords" in sys.argv))
+    elif "--saved" in sys.argv:
+        print(_format_saved(short="--short" in sys.argv))
     elif "--load" in sys.argv:
         idx = sys.argv.index("--load")
         arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
@@ -3780,6 +3883,8 @@ Commands:
                        [--pwd | --all]      Scope to / out of the current dir
                        [--oneline | --full] Compact table / verbose layout
   save [sid|tag]       Snapshot current (or given) session for restore
+  saved [--short]      List saved snapshots (newest first), with their id
+                       fragment for `clexo load`
 
 Tags:
   tag <name> [--force] [sid]   Tag current (or given) session; --force to replace
@@ -3880,6 +3985,7 @@ def main(argv=None):
         "search":        "--search",
         "tag":           "--tag",
         "tags":          "--tags",
+        "saved":         "--saved",
         "untag":         "--untag",
         "load":          "--load",
         "resume":        "--resume",

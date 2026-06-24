@@ -45,15 +45,35 @@ A typical snapshot is 5–20 KB — small enough to be lossless to load instantl
 $ !clexo save
 Wrote snapshot: 14,961 chars ≈ 3.7K tokens
 Compacted from ~205K msg tokens (98% smaller)
-Tagged 'clexo-improve-gain'
+Reload later: clexo load 8f3a72b1
 Run /clear — snapshot auto-restores on next message.
 ```
 
 The "Compacted from …" line is dropped on tiny sessions where the snapshot skeleton
-(headers, file refs) makes the snapshot no smaller than the source. The "Tagged …"
-line only appears the first time a session is saved — subsequent saves on the same
-session reuse its existing tag rather than creating new ones. See
-[tags.md](tags.md#auto-tags) for the naming rules.
+(headers, file refs) makes the snapshot no smaller than the source. The "Reload later …"
+line gives the session-id fragment you'd pass to `clexo load` — saving does **not** create
+a tag. Add one yourself with `clexo tag <name>` when you want a memorable handle (see
+[tags.md](tags.md#on-demand-tag-names)).
+
+## Listing saved snapshots
+
+`clexo saved` lists every session that has a snapshot on disk, newest first, with the
+id fragment to reload it:
+
+```
+$ clexo saved --short
+12 saved snapshot(s):
+
+8f3a72b1  2026-06-24  clexo
+1a6e9328  2026-06-24  en/IN          @en-in-analyze-competitor
+702164c7  2026-06-23  Webapp         @checkout-auth-fix
+…
+```
+
+Each row shows the fragment, date (last activity, falling back to when the snapshot was
+written), project, and any tags. Drop `--short` for the full listing — opening/last user
+message and a ready-to-paste `clexo load <fragment>` per snapshot. This is the
+untagged-friendly counterpart to `clexo tags`, which lists only sessions you've named.
 
 ## Picking a session to restore
 

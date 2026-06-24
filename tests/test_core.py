@@ -142,6 +142,7 @@ def _isolate_clexo_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "CLEXO_DIR",        tmp_path)
     monkeypatch.setattr(server, "DB_PATH",          tmp_path / "index.db")
     monkeypatch.setattr(server, "REFRESH_PENDING",  tmp_path / "refresh-pending")
+    monkeypatch.setattr(server, "REFRESH_EXPLICIT", tmp_path / "refresh-explicit")
     monkeypatch.setattr(server, "_CHAIN_LOADED",    tmp_path / "chain-loaded")
     monkeypatch.setattr(server, "ARCHIVE_DIR",      tmp_path / "archive")
     monkeypatch.setattr(server, "ARCHIVE_CACHE",    tmp_path / "cache")
@@ -313,6 +314,40 @@ def test_session_start_hook_cwd_guard_fails_open_when_cwd_unindexed(tmp_path, mo
     server._session_start_hook()
     data = json.loads(capsys.readouterr().out)
     assert "hookSpecificOutput" in data
+
+
+def test_session_start_hook_explicit_load_bypasses_cwd_guard(tmp_path, monkeypatch, capsys):
+    # An explicit `clexo load` marks the restore; it loads even in a different
+    # directory, with a note showing the original dir.
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "eeeeeeee-1111-2222-3333-444444444444"
+    _seed_pending_chain(tmp_path, sid, "/Users/me/Code/projA")
+    (tmp_path / "refresh-explicit").write_text(sid)
+    _feed_hook_stdin(monkeypatch, cwd="/Users/me/Code/projB")
+    server._session_start_hook()
+    data = json.loads(capsys.readouterr().out)
+    assert "hookSpecificOutput" in data                     # restored despite mismatch
+    assert "projA" in data["systemMessage"]                 # cross-dir note present
+    assert not (tmp_path / "refresh-explicit").exists()     # marker consumed once
+
+
+def test_session_start_hook_explicit_marker_consumed_not_reused(tmp_path, monkeypatch, capsys):
+    # The explicit marker is one-shot: a later automatic restore re-earns the guard.
+    _isolate_clexo_dir(tmp_path, monkeypatch)
+    sid = "ffffffff-1111-2222-3333-444444444444"
+    _seed_pending_chain(tmp_path, sid, "/Users/me/Code/projA")
+    (tmp_path / "refresh-explicit").write_text(sid)
+    _feed_hook_stdin(monkeypatch, cwd="/Users/me/Code/projB")
+    server._session_start_hook()
+    capsys.readouterr()  # drain first restore
+
+    # Simulate an auto-restore of the same pending session from the wrong dir.
+    (tmp_path / "refresh-pending").write_text(sid)
+    _feed_hook_stdin(monkeypatch, cwd="/Users/me/Code/projB")
+    server._session_start_hook()
+    data = json.loads(capsys.readouterr().out)
+    assert "hookSpecificOutput" not in data                 # guard back in force
+    assert "deferred" in data["systemMessage"]
 
 
 # ── Tags ──────────────────────────────────────────────────────────────────────

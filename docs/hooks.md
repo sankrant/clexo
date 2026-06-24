@@ -16,7 +16,8 @@ starts in the **same directory** the saved session ran in. If you save in projec
 A and the next session starts in an unrelated project B, the restore is *deferred*
 rather than injected — you'll see a short "Auto-restore deferred" note instead of
 project A's context. The pending snapshot is kept, so starting a session back in
-project A still restores it (or run `clexo load <tag>` to pull it in anywhere).
+project A still restores it. An explicit `clexo load <fragment-or-tag>` bypasses this
+guard — it always loads, even in another directory, and notes where it came from.
 
 Disable the safeguard with `"autoload_cwd_guard": false` in `~/.clexo/config.json`
 to always inject the pending snapshot regardless of directory.
