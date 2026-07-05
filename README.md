@@ -58,9 +58,29 @@ pipx install git+https://github.com/sankrant/clexo
 clexo install
 ```
 
-`pipx` installs clexo into an isolated environment and puts the `clexo` command on your PATH — no system-Python pollution, and no "python3 too old", since pipx picks a suitable interpreter for you. `clexo install` then wires it into Claude Code: it registers the MCP server (`clexo serve`) and installs the SessionStart + SessionEnd hooks that enable auto-restore. Both are idempotent and safe to re-run.
+Two steps: `pipx` installs the `clexo` command into an isolated environment (no system-Python pollution, and no "python3 too old" — pipx picks a suitable interpreter); `clexo install` then wires it into Claude Code. Both are idempotent and safe to re-run.
 
 > No `pipx`? Add it with `brew install pipx` (macOS) or `python3 -m pip install --user pipx`. Prefer [`uv`](https://docs.astral.sh/uv/)? `uv tool install git+https://github.com/sankrant/clexo`. Working from a local checkout? `git clone … && cd clexo && ./install.sh` runs the same two steps.
+
+### What the install does
+
+Nothing hidden — two steps, each with one job:
+
+| Step | What it does | What it touches |
+|------|--------------|-----------------|
+| **`pipx install …`** | Isolated venv with clexo + its one dependency (`mcp`); puts the `clexo` command on PATH. **Touches nothing in Claude Code.** | `~/.local/bin/clexo` |
+| **`clexo install`** | Registers the MCP server and adds two hooks. Idempotent; backs up `settings.json` first; re-points an older install. | `~/.claude.json` (MCP), `~/.claude/settings.json` (hooks) |
+
+The two hooks `clexo install` adds to `~/.claude/settings.json`:
+
+- **`SessionStart` → `clexo session-start`** — restores a pending snapshot after `/clear` (the auto-restore behavior)
+- **`SessionEnd` → `clexo sync`** — indexes the just-ended session in the background
+
+It registers one MCP server: `claude mcp add --scope user clexo clexo serve`. Upgrading from an older install? `clexo install` re-points stale `server.py`-based hooks/MCP to the `clexo` command and removes the old `~/.local/bin/clexo` symlink.
+
+clexo's own data — the search index, transcript archive, and snapshots — lives in **`~/.clexo/`**, created on first use. No daemon, no API key, nothing sent anywhere. (Hook details: [docs/hooks.md](docs/hooks.md).)
+
+**To remove clexo:** `claude mcp remove --scope user clexo`, delete the clexo `SessionStart`/`SessionEnd` blocks from `~/.claude/settings.json`, then `pipx uninstall clexo` (and optionally `rm -rf ~/.clexo` to drop the index/archive).
 
 ### Try it
 
