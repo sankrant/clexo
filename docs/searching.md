@@ -48,6 +48,10 @@ clexo search "deploy" --source_filter codex
 # Cap the number of results
 clexo search "deploy" --limit 3
 
+# Display the same results oldest-first, so the latest match lands last
+clexo search "deploy" -t
+clexo search "deploy" --time
+
 # Scope to the current working directory (sessions started here)
 clexo search "deploy" --pwd
 
@@ -97,6 +101,12 @@ term more densely, rather than losing to it on relevance alone. Ranking
 happens per session, not per matching message, so one chatty session can't
 occupy every result slot and crowd other matching sessions out of the
 results.
+
+`-t` / `--time` doesn't change which sessions are selected — it just displays
+them in ascending chronological order instead, oldest first, so the most
+recent match lands last (the bottom of the terminal, right where the
+`resume`/`load` legend already points). The MCP tool takes the same switch via
+`sort="time"` (default `"relevance"`).
 
 ## Output
 

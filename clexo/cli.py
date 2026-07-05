@@ -2096,11 +2096,14 @@ def _recency_score(ts: str, half_life_days: float = _SEARCH_RECENCY_HALF_LIFE_DA
 
 
 def _search(query: str, limit: int = 10, project_filter: str = "",
-            source_filter: str = "", cwd_filter: str = "", mode: str = "cards") -> str:
+            source_filter: str = "", cwd_filter: str = "", mode: str = "cards",
+            sort: str = "relevance") -> str:
     """Search indexed sessions. Returns a formatted string. `mode` selects the
     layout — 'cards' (default), 'full' (open+last+all matches), or 'oneline'.
     `cwd_filter`, when set, restricts results to sessions whose working directory
-    is exactly that path (the --pwd scope)."""
+    is exactly that path (the --pwd scope). `sort="time"` displays the selected
+    results in ascending chronological order (oldest first, latest last) instead
+    of by combined relevance/recency rank; selection is unaffected."""
     db = get_db()
     sync_all(db, throttle=True)
     _stat("search_calls", conn=db)
@@ -2193,6 +2196,8 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
         scored.append((combined, session_id, ts))
     scored.sort(key=lambda t: -t[0])
     winners = scored[:limit]
+    if sort == "time":
+        winners.sort(key=lambda t: t[2])  # ascending ts — oldest first, latest last
 
     placeholders = ",".join("?" for _ in winners)
     snippet_rows = db.execute(f"""
@@ -2238,9 +2243,10 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
 
 def _list_recent_sessions(limit: int = 10, project_filter: str = "",
                           source_filter: str = "", cwd_filter: str = "",
-                          mode: str = "cards") -> str:
+                          mode: str = "cards", sort: str = "relevance") -> str:
     """List recent sessions newest-first, optionally narrowed by project / source
-    / working directory. Used when search is called with an empty query."""
+    / working directory. Used when search is called with an empty query.
+    `sort="time"` reverses the same selected sessions to oldest-first display."""
     db = get_db()
     sync_all(db, throttle=True)
     color = _use_color()
@@ -2261,6 +2267,8 @@ def _list_recent_sessions(limit: int = 10, project_filter: str = "",
         FROM sessions {where}
         ORDER BY last_ts DESC LIMIT ?
     """, params + [limit]).fetchall()
+    if sort == "time":
+        rows = list(reversed(rows))
     scope = f" in {_short_path(cwd_filter)}" if cwd_filter else ""
     if not rows:
         widen = "  (use --all to list every directory)" if cwd_filter else ""
@@ -2276,17 +2284,21 @@ def _list_recent_sessions(limit: int = 10, project_filter: str = "",
 
 
 def search_sessions(query: str = "", limit: int = 10, project_filter: str = "",
-                    source_filter: str = "", pwd=None, mode: str = "cards") -> str:
+                    source_filter: str = "", pwd=None, mode: str = "cards",
+                    sort: str = "relevance") -> str:
     """Full-text search across the archive, or list recent sessions when the
     query is empty. Resolves "this"/"cwd"/"." project aliases and applies the
     --pwd working-directory scope (`pwd` True/False overrides the configured
-    default). Shared entry point for the MCP `search` tool and `clexo search`."""
+    default). `sort="time"` displays the same results in ascending chronological
+    order (oldest first, latest last) instead of by relevance/recency rank.
+    Shared entry point for the MCP `search` tool and `clexo search`."""
     pf = _resolve_project_filter(project_filter)
     cwd_filter = _pwd_dir() if _pwd_scope(pwd) else ""
     if not query.strip():
-        return _list_recent_sessions(limit, pf, source_filter, cwd_filter, mode)
+        return _list_recent_sessions(limit, pf, source_filter, cwd_filter, mode, sort)
     return _search(query, limit=limit, project_filter=pf,
-                   source_filter=source_filter, cwd_filter=cwd_filter, mode=mode)
+                   source_filter=source_filter, cwd_filter=cwd_filter, mode=mode,
+                   sort=sort)
 
 
 # Flags the `clexo search` CLI understands; each takes a value. The rest of the
@@ -2300,14 +2312,15 @@ _SEARCH_FLAGS = {
 }
 
 # Valueless flags: --pwd / --all scope to (or out of) the current directory;
-# --oneline / --full pick the result layout.
-_SEARCH_BOOL_FLAGS = {"--pwd", "--all", "--oneline", "--full"}
+# --oneline / --full pick the result layout; -t / --time switch to ascending
+# chronological display (oldest first, latest last).
+_SEARCH_BOOL_FLAGS = {"--pwd", "--all", "--oneline", "--full", "-t", "--time"}
 
 def _parse_search_args(args: list[str]) -> tuple[str, dict]:
     """Split `clexo search` argv into (query, opts), pulling out --flags so they
     aren't swallowed into the FTS query."""
     opts = {"source_filter": "", "project_filter": "", "limit": 10,
-            "pwd": None, "mode": "cards"}
+            "pwd": None, "mode": "cards", "sort": "relevance"}
     query: list[str] = []
     i = 0
     while i < len(args):
@@ -2321,6 +2334,8 @@ def _parse_search_args(args: list[str]) -> tuple[str, dict]:
                 opts["mode"] = "oneline"
             elif a == "--full":
                 opts["mode"] = "full"
+            elif a in ("-t", "--time"):
+                opts["sort"] = "time"
             i += 1
             continue
         key = val = None
@@ -2590,7 +2605,8 @@ def _run_server():
 
     @app.tool()
     def search(query: str = "", limit: int = 10, project_filter: str = "",
-               source_filter: str = "", pwd: bool | None = None) -> str:
+               source_filter: str = "", pwd: bool | None = None,
+               sort: str = "relevance") -> str:
         """Full-text search across the indexed archive of all past Claude Code,
         Codex, and Grok Build sessions — every user message, assistant reply,
         and tool result. The broad entry point for any backward reference to
@@ -2625,9 +2641,12 @@ def _run_server():
                  current directory; False searches every directory. If a result
                  says "+N more in other directories · use --all", that is the CLI
                  hint — call search again with pwd=False to widen across all dirs.
+            sort: "relevance" (default, blends text match with recency) or
+                  "time" — same selected results, displayed oldest first so
+                  the most recent session lands last.
         """
         return search_sessions(query, limit=limit, project_filter=project_filter,
-                                source_filter=source_filter, pwd=pwd)
+                                source_filter=source_filter, pwd=pwd, sort=sort)
 
     @app.tool()
     def grok_search(query: str = "", limit: int = 10, project_filter: str = "",
@@ -3784,7 +3803,7 @@ def _dispatch():
         print(search_sessions(query, limit=opts["limit"],
                               project_filter=opts["project_filter"],
                               source_filter=opts["source_filter"],
-                              pwd=opts["pwd"], mode=opts["mode"]))
+                              pwd=opts["pwd"], mode=opts["mode"], sort=opts["sort"]))
     elif "--save" in sys.argv:
         idx = sys.argv.index("--save")
         arg = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""

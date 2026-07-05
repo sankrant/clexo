@@ -179,6 +179,34 @@ def test_parse_search_args_all_and_full():
 def test_parse_search_args_defaults():
     _, opts = server._parse_search_args(["q"])
     assert opts["pwd"] is None and opts["mode"] == "cards"
+    assert opts["sort"] == "relevance"
+
+
+def test_parse_search_args_time_flag():
+    _, opts = server._parse_search_args(["q", "-t"])
+    assert opts["sort"] == "time"
+    _, opts = server._parse_search_args(["q", "--time"])
+    assert opts["sort"] == "time"
+
+
+def test_search_time_sort_orders_ascending(tmp_path, monkeypatch):
+    # -t / --time keeps the same selected sessions but displays them oldest
+    # first, so the most recent match lands last.
+    monkeypatch.setattr(server, "DB_PATH", tmp_path / "timesort.db")
+    monkeypatch.setattr(server, "sync_all", lambda *a, **k: 0)
+    db = server.get_db()
+    sids_by_age = [
+        ("11111111-1111-1111-1111-111111111111", "2020-01-01T00:00:00Z"),
+        ("22222222-2222-2222-2222-222222222222", "2022-01-01T00:00:00Z"),
+        ("33333333-3333-3333-3333-333333333333", "2024-01-01T00:00:00Z"),
+    ]
+    for sid, ts in sids_by_age:
+        _insert_session(db, sid, ts, ["thingamajig mention"])
+
+    result = server._search("thingamajig", limit=3, sort="time")
+    indices = [result.index(sid[:8]) for sid, _ in sids_by_age]
+    assert indices == sorted(indices), (
+        f"expected oldest-to-newest order with latest last:\n{result}")
 
 
 def test_pwd_scope_explicit_overrides_config(monkeypatch):
