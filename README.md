@@ -177,7 +177,7 @@ When clexo is registered as an MCP server, Claude can invoke these directly. You
 
 | Tool | What it does |
 |------|--------------|
-| `search` | FTS search across all sessions (filters: `project_filter`, `source_filter='claude'\|'codex'`). Empty query = list recent. |
+| `search` | FTS search across all sessions (filters: `project_filter`, `source_filter='claude'\|'codex'`, `pwd=true` to scope to the current directory). `sort='time'` displays results oldest-first. Empty query = list recent. |
 | `load` | Load a session's snapshot (summary + recent exchanges) into context. Accepts UUID or tag. |
 | `save` | Snapshot the current session for restore on the next start. |
 | `pick` | Drill into a session's raw exchanges (incl. tool output). FTS-anchored; supports `before`/`after` scroll. Accepts UUID or tag. |

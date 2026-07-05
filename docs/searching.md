@@ -154,6 +154,7 @@ If the summary isn't enough, `pick` drills into the same session for raw context
 ```bash
 clexo search                  # all sources
 clexo search --source_filter codex   # recent Codex sessions only
+clexo search -t                      # same list, oldest-first
 ```
 
 Useful for "what was I working on yesterday?" without remembering keywords.
