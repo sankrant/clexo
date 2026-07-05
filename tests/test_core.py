@@ -1,4 +1,5 @@
 """Core tests for clexo server functions."""
+import datetime
 import io
 import json
 import os
@@ -76,6 +77,79 @@ def test_search_no_results(tmp_path, monkeypatch):
     server.get_db()
     result = server._search("xyzzy_no_such_term_qqqq")
     assert "No results" in result
+
+
+def _insert_session(db, sid, ts, content_per_message):
+    """Test helper: index one synthetic session with one message per string
+    in `content_per_message`, all timestamped `ts`."""
+    for content in content_per_message:
+        db.execute(
+            "INSERT INTO messages(session_id, project, role, content, ts) VALUES (?,?,?,?,?)",
+            (sid, "proj", "assistant", content, ts))
+    db.execute(
+        "INSERT INTO sessions(session_id, project, first_user_msg, last_ts, cwd) "
+        "VALUES (?,?,?,?,?)", (sid, "proj", content_per_message[0], ts, "/x"))
+    db.commit()
+
+
+def test_search_dedupes_by_session_before_limiting(tmp_path, monkeypatch):
+    # A single session with many strong keyword matches should not be able to
+    # occupy every result slot and crowd other matching sessions out of the
+    # results entirely — this is what let a real, recent session vanish from
+    # `clexo search grafana` for weeks: the old query limited raw matching
+    # message rows (ranked by BM25) *before* deduping by session.
+    monkeypatch.setattr(server, "DB_PATH", tmp_path / "dedupe.db")
+    monkeypatch.setattr(server, "sync_all", lambda *a, **k: 0)
+    db = server.get_db()
+    noisy = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    _insert_session(db, noisy, "2020-01-01T00:00:00Z",
+                     [f"needle needle needle message {i}" for i in range(20)])
+    others = [f"bbbbbbb{i}-bbbb-bbbb-bbbb-bbbbbbbbbbbb" for i in range(5)]
+    for i, sid in enumerate(others):
+        _insert_session(db, sid, "2020-01-01T00:00:00Z", [f"needle occurrence {i}"])
+
+    result = server._search("needle", limit=4)
+    distinct_hits = {sid[:8] for sid in [noisy] + others if sid[:8] in result}
+    assert len(distinct_hits) == 4, (
+        "expected 4 distinct sessions (one result slot each), got overlap "
+        f"crowded out by a single chatty session:\n{result}")
+
+
+def test_recency_score_decays_with_age():
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    half_life_ago = (datetime.datetime.now(datetime.timezone.utc) -
+                     datetime.timedelta(days=server._SEARCH_RECENCY_HALF_LIFE_DAYS)).isoformat()
+    assert server._recency_score(now_iso) == pytest.approx(1.0, abs=0.01)
+    assert server._recency_score(half_life_ago) == pytest.approx(0.5, abs=0.01)
+    assert server._recency_score("2000-01-01T00:00:00Z") < 0.01
+    assert server._recency_score("not a timestamp") == 0.5  # neutral on parse failure
+
+
+def test_search_recency_offsets_stale_relevance(tmp_path, monkeypatch):
+    # Recency and relevance are weighted evenly: a session from today should
+    # outrank one from years ago even though the old one repeats the search
+    # term more densely — as long as the relevance gap isn't overwhelming.
+    # Two fillers push both subjects off the extreme top/bottom rank position
+    # (where relevance_score saturates to a binary 0.0/1.0), so the old
+    # session's real-but-modest relevance edge over the new one is what's
+    # actually being offset by recency, not a rank-position artifact.
+    monkeypatch.setattr(server, "DB_PATH", tmp_path / "recency.db")
+    monkeypatch.setattr(server, "sync_all", lambda *a, **k: 0)
+    db = server.get_db()
+    _insert_session(db, "11111111-1111-1111-1111-111111111111", "2022-01-01T00:00:00Z",
+                     ["gizmo gizmo gizmo gizmo gizmo gizmo top filler"])
+    _insert_session(db, "22222222-2222-2222-2222-222222222222", "2022-06-01T00:00:00Z",
+                     ["gizmo gizmo gizmo gizmo gizmo second filler"])
+    old_sid = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    new_sid = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    _insert_session(db, old_sid, "2015-01-01T00:00:00Z", ["gizmo gizmo gizmo appears here"])
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    _insert_session(db, new_sid, now_iso, ["gizmo appears here"])
+
+    result = server._search("gizmo", limit=4)
+    assert new_sid[:8] in result and old_sid[:8] in result
+    assert result.index(new_sid[:8]) < result.index(old_sid[:8]), (
+        f"expected the recent session to rank ahead of the stale, denser match:\n{result}")
 
 
 # ── Search output formatting + scope flags ────────────────────────────────────

@@ -2075,6 +2075,26 @@ def _build_hit(db, n: int, sid: str, ts: str, source: str, path: str,
     }
 
 
+# Session-level ranking for `_search`: relevance and recency are weighted
+# evenly — every candidate already matched the query, so recency still
+# matters as much as how well it matches. Recency halves every
+# _SEARCH_RECENCY_HALF_LIFE_DAYS.
+_SEARCH_RECENCY_WEIGHT = 0.5
+_SEARCH_RECENCY_HALF_LIFE_DAYS = 14.0
+
+
+def _recency_score(ts: str, half_life_days: float = _SEARCH_RECENCY_HALF_LIFE_DAYS) -> float:
+    """Exponential-decay recency score in (0, 1]: 1.0 for 'now', 0.5 at
+    `half_life_days` old. Returns a neutral 0.5 if `ts` fails to parse."""
+    try:
+        when = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        now = datetime.datetime.now(when.tzinfo) if when.tzinfo else datetime.datetime.now()
+        age_days = max(0.0, (now - when).total_seconds() / 86400)
+    except Exception:
+        return 0.5
+    return 0.5 ** (age_days / half_life_days)
+
+
 def _search(query: str, limit: int = 10, project_filter: str = "",
             source_filter: str = "", cwd_filter: str = "", mode: str = "cards") -> str:
     """Search indexed sessions. Returns a formatted string. `mode` selects the
@@ -2111,15 +2131,20 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
         params.append(cwd_filter)
     where = " AND ".join(conditions)
 
+    # Pull a candidate pool of raw matches ranked by BM25 — wide enough that
+    # the session-level re-ranking below has real sessions to choose from.
+    # Limiting to `limit` raw rows here (as before) let one chatty session
+    # occupy several slots and crowd other matching sessions out of the
+    # results entirely, no matter how recent or relevant they were.
+    pool_size = min(500, max(200, limit * 20))
     try:
-        rows = db.execute(f"""
-            SELECT m.session_id, m.project, m.role,
-                   snippet(messages, 3, char(2), char(3), '...', 20) AS snip, m.ts
+        pool = db.execute(f"""
+            SELECT m.session_id, rank, m.ts
             FROM messages m
             JOIN sessions s ON s.session_id = m.session_id
             WHERE {where}
             ORDER BY rank LIMIT ?
-        """, params + [limit]).fetchall()
+        """, params + [pool_size]).fetchall()
     except Exception as e:
         return f"Search error: {e}"
 
@@ -2141,35 +2166,65 @@ def _search(query: str, limit: int = 10, project_filter: str = "",
             more_elsewhere = 0
 
     scope = f" in {_short_path(cwd_filter)}" if cwd_filter else ""
-    if not rows:
+    if not pool:
         if cwd_filter and more_elsewhere:
             return (f"No results for '{query}'{scope} — but {more_elsewhere} "
                     f"in other directories. Use --all to search everywhere.")
         widen = "  (use --all to search every directory)" if cwd_filter else ""
         return f"No results for '{query}'{scope}.{widen}"
 
-    seen: dict = {}
-    for session_id, project, role, snip, ts in rows:
-        if session_id not in seen:
-            sess = db.execute(
-                "SELECT first_user_msg, cwd, source, thread_name FROM sessions WHERE session_id=?",
-                [session_id]
-            ).fetchone()
-            source      = (sess[2] or "claude") if sess else "claude"
-            thread_name = (sess[3] or "")       if sess else ""
-            cwd         = (sess[1] or "")       if sess else ""
-            seen[session_id] = {
-                "path":        _short_path(cwd, project),
-                "source":      source,
-                "thread_name": thread_name,
-                "snippets":    [],
-                "ts":          ts,
-            }
-        seen[session_id]["snippets"].append(f"[{role}] {snip}")
+    # Best (lowest = most relevant) BM25 rank per session, plus the timestamp
+    # of that matching message. Dedup happens here, before any limit is
+    # applied — a session can no longer be excluded just because some other
+    # session's messages happened to fill the pool first.
+    best: dict = {}
+    for session_id, rank, ts in pool:
+        cur = best.get(session_id)
+        if cur is None or rank < cur[0]:
+            best[session_id] = (rank, ts)
 
-    hits = [_build_hit(db, i, sid, info["ts"], info["source"], info["path"],
-                       info["thread_name"], info["snippets"])
-            for i, (sid, info) in enumerate(seen.items(), 1)]
+    ranked = sorted(best.items(), key=lambda kv: kv[1][0])
+    n = len(ranked)
+    scored = []
+    for i, (session_id, (rank, ts)) in enumerate(ranked):
+        relevance_score = 1.0 - (i / (n - 1)) if n > 1 else 1.0
+        combined = (_SEARCH_RECENCY_WEIGHT * _recency_score(ts) +
+                   (1 - _SEARCH_RECENCY_WEIGHT) * relevance_score)
+        scored.append((combined, session_id, ts))
+    scored.sort(key=lambda t: -t[0])
+    winners = scored[:limit]
+
+    placeholders = ",".join("?" for _ in winners)
+    snippet_rows = db.execute(f"""
+        SELECT m.session_id, m.role,
+               snippet(messages, 3, char(2), char(3), '...', 20) AS snip
+        FROM messages m
+        WHERE messages MATCH ? AND m.session_id IN ({placeholders})
+        ORDER BY rank
+    """, [fts_query] + [sid for _, sid, _ in winners]).fetchall()
+
+    # Cap snippets per session — the renderer only ever shows the first one
+    # or two anyway, and an unbounded chatty session shouldn't dominate here.
+    seen: dict = {sid: {"snippets": [], "ts": ts} for _, sid, ts in winners}
+    for session_id, role, snip in snippet_rows:
+        entry = seen.get(session_id)
+        if entry is not None and len(entry["snippets"]) < 3:
+            entry["snippets"].append(f"[{role}] {snip}")
+
+    for sid, info in seen.items():
+        sess = db.execute(
+            "SELECT project, first_user_msg, cwd, source, thread_name FROM sessions WHERE session_id=?",
+            [sid]
+        ).fetchone()
+        project = (sess[0] or "") if sess else ""
+        cwd     = (sess[2] or "") if sess else ""
+        info["source"]      = (sess[3] or "claude") if sess else "claude"
+        info["thread_name"] = (sess[4] or "")       if sess else ""
+        info["path"]        = _short_path(cwd, project)
+
+    hits = [_build_hit(db, i, sid, seen[sid]["ts"], seen[sid]["source"], seen[sid]["path"],
+                       seen[sid]["thread_name"], seen[sid]["snippets"])
+            for i, (_, sid, _) in enumerate(winners, 1)]
     header = f'{_plural(len(hits), "session")} · "{query}"{scope}'
     out = _render_hits(hits, header, mode, color)
     if cwd_filter:

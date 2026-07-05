@@ -89,6 +89,15 @@ as shorthands, and `--flag=value` works too.
 The MCP tool accepts the same parameters: `search(query="...", project_filter="webapp",
 source_filter="claude", pwd=true)`.
 
+## Ranking
+
+Results blend text relevance (FTS5 BM25) with recency, weighted evenly — a
+session from today competes on equal footing with an old one that repeats the
+term more densely, rather than losing to it on relevance alone. Ranking
+happens per session, not per matching message, so one chatty session can't
+occupy every result slot and crowd other matching sessions out of the
+results.
+
 ## Output
 
 ```
