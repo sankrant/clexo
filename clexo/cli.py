@@ -3380,23 +3380,42 @@ def _session_start_hook() -> None:
     else:
         stats += " · no turns"
 
-    line1 = f"  ↺  Clexo · Session restored · {date}" if date else "  ↺  Clexo · Session restored"
+    # Name the restored session by its short id so it's clear which one loaded
+    # (and matches the id in the pick() footer / `clexo` commands).
+    short = loaded_sid[:8] if loaded_sid else ""
+    cdate = _compact_date(date)
+    head = f"Session {short} restored" if short else "Session restored"
+    line1 = f"  ↺  Clexo · {head} · {cdate}" if cdate else f"  ↺  Clexo · {head}"
     line2 = f"     {summary}" if summary else None
     line3 = f"     {stats}"
     # When an explicit load is continued in a different directory, note the
     # original so the cross-directory restore is visible rather than silent.
     line4 = f"     ↳ from {cross_dir_note[0]} (loaded here)" if cross_dir_note else None
-    candidates = [line1, line3] + ([line2] if line2 else []) + ([line4] if line4 else [])
-    inner_w = max(len(s) for s in candidates) + 2
-    rows = [
-        "╔" + "═" * inner_w + "╗",
-        "║" + line1 + " " * (inner_w - len(line1)) + "║",
-    ]
+
+    # Bound the box to the terminal width. A long summary, path, or date could
+    # otherwise make a line wider than the display, and when the UI wraps it the
+    # right border lands mid-line and the whole box looks shattered. Cap the
+    # inner width and truncate any line that would exceed it. get_terminal_size
+    # falls back to COLUMNS / 80 when stdout is a pipe (the hook case).
+    body = [line1, line3] + ([line2] if line2 else []) + ([line4] if line4 else [])
+    try:
+        cols = shutil.get_terminal_size((80, 24)).columns or 80
+    except Exception:
+        cols = 80
+    max_inner = max(30, cols - 4)
+    inner_w = min(max(len(s) for s in body) + 2, max_inner)
+
+    def _row(s: str) -> str:
+        if len(s) > inner_w:
+            s = s[: inner_w - 1] + "…"
+        return "║" + s + " " * (inner_w - len(s)) + "║"
+
+    rows = ["╔" + "═" * inner_w + "╗", _row(line1)]
     if line2:
-        rows.append("║" + line2 + " " * (inner_w - len(line2)) + "║")
-    rows.append("║" + line3 + " " * (inner_w - len(line3)) + "║")
+        rows.append(_row(line2))
+    rows.append(_row(line3))
     if line4:
-        rows.append("║" + line4 + " " * (inner_w - len(line4)) + "║")
+        rows.append(_row(line4))
     rows.append("╚" + "═" * inner_w + "╝")
     banner = "\n".join(rows)
 
@@ -3539,6 +3558,22 @@ def _human_count(n: int) -> str:
     if n >= 10_000:
         return f"{n / 1_000:.1f}K"
     return f"{n:,}"
+
+
+def _compact_date(d: str) -> str:
+    """Shorten a session header date for the restore banner: drop the year and
+    timezone so it fits on one line. "2026-07-07 14:30 PDT" -> "Jul 7 14:30",
+    "2026-05-06" -> "May 6". Returns the input unchanged if it doesn't parse."""
+    d = (d or "").strip()
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}:\d{2}))?', d)
+    if not m:
+        return d
+    y, mo, da, tm = m.groups()
+    try:
+        mon = datetime.date(int(y), int(mo), int(da)).strftime("%b")
+    except Exception:
+        return d
+    return f"{mon} {int(da)} {tm}" if tm else f"{mon} {int(da)}"
 
 
 def _format_stats() -> str:

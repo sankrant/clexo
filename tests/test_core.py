@@ -329,7 +329,8 @@ def test_session_start_hook_with_pending(tmp_path, monkeypatch, capsys):
     data = json.loads(out)
     assert data["hookSpecificOutput"]["hookEventName"] == "SessionStart"
     assert "↺" in data["systemMessage"]
-    assert "2026-05-06" in data["systemMessage"]
+    assert "May 6" in data["systemMessage"]                 # date compacted, year/tz dropped
+    assert "test-uui" in data["systemMessage"]              # restored session's short id shown
     assert "hook test session" in data["systemMessage"]
     assert "Previous session context" in data["hookSpecificOutput"]["additionalContext"]
 
