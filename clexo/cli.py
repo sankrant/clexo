@@ -252,35 +252,48 @@ def _sync_claude(conn) -> int:
                 msg_type = obj.get("type")
                 ts = obj.get("timestamp", "")
 
+                # Conversational turns. A prompt the user typed while the agent
+                # was still working is stored as a queued-command `attachment`,
+                # not a `user` record — index it as the human turn it is, so it's
+                # searchable and counted like any other.
+                role = text = None
+                turn_cwd = ""
                 if msg_type in ("user", "assistant"):
                     msg  = obj.get("message", {})
                     role = msg.get("role", msg_type)
                     text = _extract_claude_text(msg.get("content", ""))
-                    if text.strip():
-                        conn.execute(
-                            "INSERT INTO messages(session_id,project,role,content,ts) VALUES(?,?,?,?,?)",
-                            [session_id, project, role, text, ts]
-                        )
-                        total += 1
-                        if role == "assistant":
-                            assistant_turns_this_pass += 1
-                        conn.execute("""
-                            INSERT INTO sessions(session_id,project,first_user_msg,last_ts,cwd,source,thread_name,last_prompt)
-                            VALUES(?,?,?,?,?,'claude','','')
-                            ON CONFLICT(session_id) DO UPDATE SET
-                                last_ts        = MAX(last_ts, excluded.last_ts),
-                                first_user_msg = CASE
-                                    WHEN excluded.first_user_msg != '' AND (first_user_msg IS NULL OR first_user_msg = '' OR first_user_msg LIKE '<%')
-                                    THEN excluded.first_user_msg
-                                    ELSE first_user_msg
-                                END,
-                                cwd            = COALESCE(cwd, excluded.cwd)
-                        """, [
-                            session_id, project,
-                            text[:200] if (role == "user" and not _is_noise(text)) else "",
-                            ts,
-                            obj.get("cwd", "") if msg_type == "user" else "",
-                        ])
+                    turn_cwd = obj.get("cwd", "") if msg_type == "user" else ""
+                elif msg_type == "attachment":
+                    prompt = _human_attachment(obj)
+                    if prompt is not None:
+                        role, text = "user", _extract_claude_text(prompt)
+                        turn_cwd = obj.get("cwd", "")
+
+                if role and text and text.strip():
+                    conn.execute(
+                        "INSERT INTO messages(session_id,project,role,content,ts) VALUES(?,?,?,?,?)",
+                        [session_id, project, role, text, ts]
+                    )
+                    total += 1
+                    if role == "assistant":
+                        assistant_turns_this_pass += 1
+                    conn.execute("""
+                        INSERT INTO sessions(session_id,project,first_user_msg,last_ts,cwd,source,thread_name,last_prompt)
+                        VALUES(?,?,?,?,?,'claude','','')
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            last_ts        = MAX(last_ts, excluded.last_ts),
+                            first_user_msg = CASE
+                                WHEN excluded.first_user_msg != '' AND (first_user_msg IS NULL OR first_user_msg = '' OR first_user_msg LIKE '<%')
+                                THEN excluded.first_user_msg
+                                ELSE first_user_msg
+                            END,
+                            cwd            = COALESCE(cwd, excluded.cwd)
+                    """, [
+                        session_id, project,
+                        text[:200] if (role == "user" and not _is_noise(text)) else "",
+                        ts,
+                        turn_cwd,
+                    ])
 
                 elif msg_type == "ai-title":
                     title = obj.get("aiTitle", "")
@@ -750,12 +763,28 @@ _NOISE_PREFIXES = (
     "# Files mentioned by the user",
     "A previous agent",
     "Base directory for this skill:",
+    # Path echo Claude Code injects alongside a pasted image — redundant with the
+    # "[Image #N]" already in the user's own message, not something they typed.
+    "[Image: source:",
+)
+
+# Harness / API error strings that surface as assistant "messages" but carry no
+# content — a dead-context turn, not something worth restoring or indexing. Left
+# unfiltered, one of these (e.g. a session that died on "Prompt is too long")
+# could be the only assistant line a snapshot keeps.
+_ERROR_MESSAGES = (
+    "Prompt is too long",
+    "API Error",
+    "Request interrupted",
 )
 
 def _is_system_noise(text: str) -> bool:
-    """True if text is system-injected — XML/HTML tags or known prefixes."""
+    """True if text is system-injected or a harness/API error — XML/HTML tags,
+    known injected prefixes, or dead-context error strings — not real content."""
     t = text.strip()
     if t.startswith("<"):
+        return True
+    if any(t.startswith(e) for e in _ERROR_MESSAGES):
         return True
     return any(t.startswith(p) for p in _NOISE_PREFIXES)
 
@@ -1414,6 +1443,26 @@ def _archive_path(session_id: str, source: str) -> Path:
     return ARCHIVE_DIR / source / f"{session_id}.jsonl.gz"
 
 
+def _human_attachment(obj: dict):
+    """Prompt content of a queued-command attachment — a message the user typed
+    while the agent was still working. Claude Code stores it as a
+    ``type: "attachment"`` record with ``attachment.origin.kind == "human"``,
+    outside the normal user/assistant stream, so any reader that gates on
+    ``type in ("user", "assistant")`` silently drops a real human turn.
+
+    Returns the prompt (a list of content blocks, or a str), or None if obj is
+    not such an attachment."""
+    if obj.get("type") != "attachment":
+        return None
+    att = obj.get("attachment")
+    if not isinstance(att, dict):
+        return None
+    origin = att.get("origin")
+    if not (isinstance(origin, dict) and origin.get("kind") == "human"):
+        return None
+    return att.get("prompt")
+
+
 def _strip_archive_line(obj: dict, source: str) -> dict | None:
     """Reduce one source JSONL line to transcript essentials, or None to drop it.
 
@@ -1437,7 +1486,24 @@ def _strip_archive_line(obj: dict, source: str) -> dict | None:
         return None
     # claude / grok: type + message{role, content}
     if obj.get("type") not in ("user", "assistant"):
-        return None
+        # A prompt the user queued while the agent was working is a real human
+        # turn stored as an attachment — keep it (text/commands only, per the
+        # archive's drop-images policy) rather than dropping the turn entirely.
+        prompt = _human_attachment(obj)
+        if prompt is None:
+            return None
+        if isinstance(prompt, list):
+            kept = [b for b in prompt if isinstance(b, dict)
+                    and b.get("type") in ("text", "tool_use")]
+            if not kept:
+                return None
+            content = kept
+        elif isinstance(prompt, str) and prompt.strip():
+            content = prompt
+        else:
+            return None
+        return {"type": "user", "timestamp": obj.get("timestamp", ""),
+                "message": {"role": "user", "content": content}}
     msg = obj.get("message")
     if not isinstance(msg, dict):
         return None
@@ -1600,11 +1666,22 @@ def _read_raw_messages(jsonl_file: Path, source: str = "claude") -> list[dict]:
                 continue
             try:
                 obj = json.loads(line)
-                if obj.get("type") not in ("user", "assistant"):
+                otype = obj.get("type")
+                if otype not in ("user", "assistant"):
+                    # A queued human prompt (typed while the agent worked) is a
+                    # real turn stored as an attachment — surface it as user.
+                    prompt = _human_attachment(obj)
+                    if prompt is None:
+                        continue
+                    msgs.append({
+                        "role":    "user",
+                        "content": prompt,
+                        "ts":      obj.get("timestamp", ""),
+                    })
                     continue
                 msg = obj.get("message", {})
                 msgs.append({
-                    "role":    msg.get("role", obj["type"]),
+                    "role":    msg.get("role", otype),
                     "content": msg.get("content", ""),
                     "ts":      obj.get("timestamp", ""),
                 })
@@ -2451,9 +2528,23 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
                                     msgs.append(('assistant', text, ts))
                                 break
                 else:
-                    if obj.get('type') not in ('user', 'assistant'): continue
+                    otype = obj.get('type')
+                    if otype == 'attachment':
+                        # A prompt the user typed while the agent was still working
+                        # is stored as a queued-command attachment, not a `user`
+                        # record. It's a real human turn — without it the run of
+                        # assistant work between two queued prompts looks like one
+                        # unbroken monologue.
+                        prompt = _human_attachment(obj)
+                        if prompt is not None:
+                            text = _extract_content(prompt, include_results=False)
+                            if text and not _is_system_noise(text):
+                                full_chars += len(text)
+                                msgs.append(('user', text, ts))
+                        continue
+                    if otype not in ('user', 'assistant'): continue
                     msg      = obj.get('message', {})
-                    role     = msg.get('role', obj['type'])
+                    role     = msg.get('role', otype)
                     raw      = msg.get('content', '')
                     text     = _extract_content(raw, include_results=False)
                     if text and not _is_system_noise(text):
@@ -2461,35 +2552,32 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
             except Exception:
                 continue
 
-    pairs, i = [], len(msgs) - 1
-    while i >= 0:
-        if msgs[i][0] == 'assistant':
-            j = i - 1
-            while j >= 0 and msgs[j][0] == 'assistant':
-                j -= 1
-            if j >= 0 and msgs[j][0] == 'user':
-                pairs.append((msgs[j], msgs[i]))
-                i = j - 1
-            else:
-                i -= 1
-        else:
-            i -= 1
-
+    # Keep the most-recent tail of the conversation as-is: every user turn and
+    # every assistant message, in order, within the char budget. Tool *output*
+    # and system/error noise are already filtered out above; the assistant's
+    # reasoning and actions are the whole point of a restore snapshot, so nothing
+    # on that side is collapsed or dropped.
+    #
+    # The old logic paired each user turn with only the *last* assistant message
+    # of the following run and threw the rest away. On a long agentic stretch —
+    # especially one where the user's prompts were queued (and thus invisible, so
+    # the whole stretch read as one assistant run) — that erased hours of work,
+    # keeping only the final message, which could be a dead-context error.
     selected, total = [], 0
-    for u, a in pairs:
-        chunk = len(u[1]) + len(a[1])
-        if total + chunk > chars_max:
+    for turn in reversed(msgs):
+        chunk = len(turn[1])
+        if selected and total + chunk > chars_max:
             break
-        selected.append((u, a))
+        selected.append(turn)
         total += chunk
         if total >= chars_min:
             break
     selected.reverse()
 
     exchanges = []
-    for u, a in selected:
-        exchanges.append(f"[USER] {u[2][:19]}\n{u[1][:20000]}\n")
-        exchanges.append(f"[ASSISTANT] {a[2][:19]}\n{a[1][:20000]}\n")
+    for role, mtext, mts in selected:
+        tag = "USER" if role == "user" else "ASSISTANT"
+        exchanges.append(f"[{tag}] {mts[:19]}\n{mtext[:20000]}\n")
 
     file_refs = sorted(set(
         re.findall(r'(?:/Users/\w[^\s,\'")\]]{5,}|~/.claude/\S+|~/Code/\S+)',
