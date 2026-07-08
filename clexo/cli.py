@@ -2574,6 +2574,7 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
             break
     selected.reverse()
 
+    total_turns = len(msgs)
     exchanges = []
     for role, mtext, mts in selected:
         tag = "USER" if role == "user" else "ASSISTANT"
@@ -2590,10 +2591,18 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
     project_raw     = (sess[4] if sess and len(sess) > 4 and sess[4] else jsonl.parent.name)
     project_display = (project_raw or "").lstrip('-').replace('-', '/')
     section_header  = f"## Session {session_id} | {date} | {source} | {project_display}"
+    # If older turns didn't fit, say so up front and over the *original*
+    # conversation — a reader never sees the snapshot's internal tail, so a count
+    # relative to it is meaningless. The total also lets the hook packer report
+    # elision over the whole session. pick() retrieves any earlier turn.
+    exch_intro = ""
+    if total_turns > len(selected):
+        exch_intro = (f"(showing the most recent {len(selected)} of {total_turns} "
+                      f"exchanges — call pick() to retrieve earlier ones)\n\n")
     section_body    = (
         f"### Summary\n{summary}\n\n"
         f"### Key files\n" + ('\n'.join(file_refs) or '(none)') + "\n\n"
-        f"### Recent exchanges\n" + '\n'.join(exchanges)
+        f"### Recent exchanges\n" + exch_intro + '\n'.join(exchanges)
     )
     new_section = f"{section_header}\n\n{section_body}"
 
@@ -3186,6 +3195,13 @@ def _pack_compact(content: str, cap: int, footer: str = "") -> dict:
     if current:
         turns.append("\n".join(current).rstrip())
 
+    # The build annotates the true original turn count ("… of N exchanges …"), so
+    # the elided count reflects the whole conversation rather than the snapshot's
+    # already-trimmed tail (which the reader never sees). Falls back to the turns
+    # present when the whole conversation fit in the snapshot.
+    m = re.search(r"most recent \d+ of (\d+) exchanges", content)
+    total_original = int(m.group(1)) if m else len(turns)
+
     # Build skeleton with a placeholder where exchanges go.
     skeleton_lines: list[str] = []
     skip = False
@@ -3212,10 +3228,10 @@ def _pack_compact(content: str, cap: int, footer: str = "") -> dict:
         kept.insert(0, turn)
         used += len(chunk)
 
-    elided = len(turns) - len(kept)
+    elided = max(0, total_original - len(kept))
     if kept and elided > 0:
         body = (
-            f"({elided} older exchange{'s' if elided != 1 else ''} elided — "
+            f"({elided} earlier exchange{'s' if elided != 1 else ''} not shown — "
             f"call pick() to retrieve)\n\n" + "\n\n".join(kept)
         )
     elif kept:
@@ -3227,7 +3243,7 @@ def _pack_compact(content: str, cap: int, footer: str = "") -> dict:
 
     return {
         "compact":     compact,
-        "total_turns": len(turns),
+        "total_turns": total_original,
         "kept":        len(kept),
         "elided":      elided,
         "budget":      budget,

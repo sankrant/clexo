@@ -335,6 +335,48 @@ def test_session_start_hook_with_pending(tmp_path, monkeypatch, capsys):
     assert "Previous session context" in data["hookSpecificOutput"]["additionalContext"]
 
 
+# ── Snapshot packing (hook context budget) ────────────────────────────────────
+
+def _snap_with_turns(n_turns, note_total=None, turn_chars=80):
+    """A minimal snapshot skeleton + n_turns exchanges, optionally annotated with
+    the build's 'most recent N of <total>' note."""
+    note = ""
+    if note_total is not None:
+        note = (f"(showing the most recent {n_turns} of {note_total} exchanges — "
+                f"call pick() to retrieve earlier ones)\n\n")
+    turns = "\n".join(
+        f"[ASSISTANT] 2026-07-07T00:00:{i:02d}\n" + f"body {i} " * (turn_chars // 8)
+        for i in range(n_turns)
+    )
+    return (
+        "## Session s | 2026-07-07 | claude | proj\n\n"
+        "### Summary\n- s\n\n"
+        "### Key files\n(none)\n\n"
+        "### Recent exchanges\n" + note + turns
+    )
+
+
+def test_pack_compact_elides_over_original_conversation():
+    # 10 turns in the snapshot, but the note says the real conversation had 400.
+    snap = _snap_with_turns(10, note_total=400)
+    r = server._pack_compact(snap, cap=500, footer="")
+    assert len(r["compact"]) <= 500
+    assert r["total_turns"] == 400                     # original, NOT the snapshot's 10
+    assert 1 <= r["kept"] < 10                          # cap forced some elision
+    assert r["elided"] == 400 - r["kept"]              # counted over the original
+    assert f"{r['elided']} earlier exchanges not shown" in r["compact"]
+
+
+def test_pack_compact_no_note_counts_present_turns():
+    # No note (whole conversation fit in the snapshot) → fall back to turns present.
+    snap = _snap_with_turns(4, note_total=None)
+    r = server._pack_compact(snap, cap=100_000, footer="")
+    assert r["total_turns"] == 4
+    assert r["kept"] == 4
+    assert r["elided"] == 0
+    assert "not shown" not in r["compact"]
+
+
 # ── Session start cwd guard ───────────────────────────────────────────────────
 
 def test_same_session_dir():
