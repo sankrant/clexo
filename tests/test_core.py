@@ -1124,3 +1124,72 @@ def test_archive_retention_prunes_old_keeps_recent_and_tagged(tmp_path, monkeypa
     assert not server._archive_path(rows[0][0], "claude").exists()   # old pruned
     assert server._archive_path(rows[1][0], "claude").exists()       # recent kept
     assert server._archive_path(rows[2][0], "claude").exists()       # tagged kept
+
+
+# ── Windows encoding (charmap) safety ───────────────────────────────────────────
+
+def test_force_utf8_io_reconfigures_cp1252_streams(monkeypatch):
+    """On Windows stdout/stderr default to the cp1252 codepage, so printing
+    Unicode (—, …, ·, box-drawing) raises UnicodeEncodeError. _force_utf8_io()
+    must reconfigure the standard streams to UTF-8 so those prints don't crash."""
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    err = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+
+    server._force_utf8_io()
+
+    assert sys.stdout.encoding.lower().replace("-", "") == "utf8"
+    assert sys.stderr.encoding.lower().replace("-", "") == "utf8"
+    # The chars clexo actually prints must round-trip without raising.
+    print("resume 1a2b3c4d… — session · range 1–3")
+    print("┌─ box ─┐", file=sys.stderr)
+
+
+def _call_args(src, open_paren_idx):
+    """Return the substring between a call's parens, honoring nesting so a
+    nested call like write_text(fin.read(), encoding=...) isn't cut short."""
+    depth = 0
+    for i in range(open_paren_idx, len(src)):
+        c = src[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return src[open_paren_idx + 1:i]
+    return src[open_paren_idx + 1:]
+
+
+def test_no_bare_text_mode_open_in_cli():
+    """Text-mode open() without encoding= uses the locale codepage (cp1252 on
+    Windows) and blows up decoding UTF-8 session files. Every text-mode open()
+    in cli.py must pin encoding=; binary ("...b") opens are exempt."""
+    src = (Path(server.__file__).parent / "cli.py").read_text(encoding="utf-8")
+    import re
+    offenders = []
+    for m in re.finditer(r"\bopen\(", src):
+        args = _call_args(src, m.end() - 1)
+        mode = args.split(",")[1] if "," in args else ""
+        if "b" in mode:
+            continue  # binary mode is byte-safe by construction
+        if "encoding" in args:
+            continue
+        offenders.append(src.count("\n", 0, m.start()) + 1)
+    assert not offenders, f"text-mode open() without encoding= at lines {offenders}"
+
+
+def test_no_bare_pathlib_text_io_in_cli():
+    """pathlib's Path.read_text()/write_text() default to the locale codepage
+    (cp1252 on Windows) exactly like open(), so they must pin encoding= too —
+    this is the class that crashed refresh_save on a '→' char. read_bytes/
+    write_bytes are byte-safe and exempt."""
+    src = (Path(server.__file__).parent / "cli.py").read_text(encoding="utf-8")
+    import re
+    offenders = []
+    for m in re.finditer(r"\.(read_text|write_text)\(", src):
+        args = _call_args(src, m.end() - 1)
+        if "encoding" in args:
+            continue
+        offenders.append(src.count("\n", 0, m.start()) + 1)
+    assert not offenders, f"pathlib text I/O without encoding= at lines {offenders}"

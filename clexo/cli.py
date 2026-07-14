@@ -346,7 +346,7 @@ def _load_codex_thread_names() -> dict:
     names = {}
     if not CODEX_SESSION_IDX.exists():
         return names
-    with open(CODEX_SESSION_IDX) as f:
+    with open(CODEX_SESSION_IDX, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -575,7 +575,7 @@ def _backfill_claude_titles(conn) -> int:
             continue
         thread_name = last_prompt = ""
         try:
-            with open(files[0]) as f:
+            with open(files[0], encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -631,7 +631,7 @@ def _config_get(key, default=None):
     """Read a single key from ~/.clexo/config.json, tolerating a missing or
     malformed file (returns `default`)."""
     try:
-        return json.loads((CLEXO_DIR / "config.json").read_text()).get(key, default)
+        return json.loads((CLEXO_DIR / "config.json").read_text(encoding="utf-8")).get(key, default)
     except Exception:
         return default
 
@@ -720,11 +720,11 @@ def _exec_load(session_id: str, source: str = "claude", allow_print: bool = True
     if err:
         print(err, file=sys.stderr)
         sys.exit(1)
-    REFRESH_PENDING.write_text(session_id)
+    REFRESH_PENDING.write_text(session_id, encoding="utf-8")
     # User ran `clexo load` deliberately — let the SessionStart hook restore it
     # even when the fresh session starts in a different directory than the saved
     # one. The same-directory safeguard only applies to automatic restores.
-    REFRESH_EXPLICIT.write_text(session_id)
+    REFRESH_EXPLICIT.write_text(session_id, encoding="utf-8")
     binary = _resume_binary(source or "claude")
     if sys.stdout.isatty():
         os.execvp(binary, [binary])
@@ -1033,7 +1033,7 @@ def _resolve_current_or_given_session(session_id: str = "") -> tuple[str, str]:
         candidates: list = []
         for sfile in sessions_dir.glob("*.json"):
             try:
-                d = json.loads(sfile.read_text())
+                d = json.loads(sfile.read_text(encoding="utf-8"))
             except Exception:
                 continue
             if d.get("cwd") == pwd and d.get("sessionId"):
@@ -1245,7 +1245,7 @@ def _chain_summary(sid: str) -> str:
         if not f.exists():
             continue
         try:
-            content = f.read_text()
+            content = f.read_text(encoding="utf-8")
         except Exception:
             continue
         matches = _SUMMARY_RE.findall(content)
@@ -1568,7 +1568,7 @@ def _archive_retention_days() -> int:
     """How long to keep clexo's transcript archives, from the
     `archive_retention_days` config key. 0 / absent = keep forever (default)."""
     try:
-        val = json.loads((CLEXO_DIR / "config.json").read_text()).get("archive_retention_days", 0)
+        val = json.loads((CLEXO_DIR / "config.json").read_text(encoding="utf-8")).get("archive_retention_days", 0)
         return int(val or 0)
     except Exception:
         return 0
@@ -1659,7 +1659,7 @@ def _read_raw_messages(jsonl_file: Path, source: str = "claude") -> list[dict]:
     if source == "codex" or CODEX_SESSIONS in jsonl_file.parents:
         return _read_raw_messages_codex(jsonl_file)
     msgs = []
-    with open(jsonl_file) as f:
+    with open(jsonl_file, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -1693,7 +1693,7 @@ def _read_raw_messages(jsonl_file: Path, source: str = "claude") -> list[dict]:
 def _read_raw_messages_codex(jsonl_file: Path) -> list[dict]:
     """Full history from a Codex JSONL — all turns across compaction boundaries."""
     msgs = []
-    with open(jsonl_file) as f:
+    with open(jsonl_file, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -1821,7 +1821,7 @@ def _load_chain_content(sid: str) -> str | None:
     f = CLEXO_DIR / f"chain-{sid}.md"
     if not f.exists():
         return None
-    sections = _parse_chain_sections(f.read_text())
+    sections = _parse_chain_sections(f.read_text(encoding="utf-8"))
     if not sections:
         return None
     all_ids  = [s[0] for s in sections]
@@ -1839,7 +1839,7 @@ def _find_chain_prev(session_id: str) -> str | None:
     f = CLEXO_DIR / f"chain-{_loaded_session_id}.md"
     if not f.exists():
         return None
-    uuids = _CHAIN_RE.findall(f.read_text())
+    uuids = _CHAIN_RE.findall(f.read_text(encoding="utf-8"))
     try:
         idx = uuids.index(session_id)
         return uuids[idx - 1] if idx > 0 else None
@@ -1858,7 +1858,7 @@ def _resolve_project_filter(raw: str) -> str:
         return raw
     try:
         best = max(_CLAUDE_SESSIONS.glob("*.json"), key=lambda p: p.stat().st_mtime)
-        data = json.loads(best.read_text())
+        data = json.loads(best.read_text(encoding="utf-8"))
         cwd = data.get("cwd", "")
         if cwd:
             return Path(cwd).name
@@ -2495,7 +2495,7 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
         summary = "(session not in index yet)"
 
     try:
-        cfg = json.loads(CFG_PATH.read_text())
+        cfg = json.loads(CFG_PATH.read_text(encoding="utf-8"))
     except Exception:
         cfg = {}
     chars_min = cfg.get("refresh_tokens_min", 4000) * 4
@@ -2503,7 +2503,7 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
 
     msgs = []
     full_chars = 0
-    with open(jsonl) as f:
+    with open(jsonl, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line: continue
@@ -2609,25 +2609,25 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
     global _loaded_session_id
     chain_sid = _loaded_session_id
     if not chain_sid and _CHAIN_LOADED.exists():
-        chain_sid = _CHAIN_LOADED.read_text().strip()
+        chain_sid = _CHAIN_LOADED.read_text(encoding="utf-8").strip()
         _CHAIN_LOADED.unlink(missing_ok=True)
 
     prior_content = ""
     if chain_sid and chain_sid != session_id:
         old_chain = CLEXO_DIR / f"chain-{chain_sid}.md"
         if old_chain.exists():
-            prior_content = old_chain.read_text().rstrip() + "\n\n"
+            prior_content = old_chain.read_text(encoding="utf-8").rstrip() + "\n\n"
             old_chain.unlink()
         else:
             old_refresh = CLEXO_DIR / f"refresh-{chain_sid}.md"
             if old_refresh.exists():
-                prior_content = f"## Session {chain_sid} | [migrated]\n\n{old_refresh.read_text()}\n\n"
+                prior_content = f"## Session {chain_sid} | [migrated]\n\n{old_refresh.read_text(encoding='utf-8')}\n\n"
                 old_refresh.unlink()
 
     chain_file = CLEXO_DIR / f"chain-{session_id}.md"
-    chain_file.write_text(prior_content + new_section)
+    chain_file.write_text(prior_content + new_section, encoding="utf-8")
     _loaded_session_id = session_id
-    REFRESH_PENDING.write_text(session_id)
+    REFRESH_PENDING.write_text(session_id, encoding="utf-8")
     _stat("refresh_saves", conn=db)
 
     total_chars = len(prior_content) + len(new_section)
@@ -2933,10 +2933,10 @@ def _run_server():
             refresh_save(session_id)
         result = _refresh_load(session_id)
         if "## Session" in result or "# Refresh Context" in result:
-            REFRESH_PENDING.write_text(session_id)
+            REFRESH_PENDING.write_text(session_id, encoding="utf-8")
             # Deliberate load — the next session start should restore it even
             # from a different directory (see the cwd guard in the hook).
-            REFRESH_EXPLICIT.write_text(session_id)
+            REFRESH_EXPLICIT.write_text(session_id, encoding="utf-8")
             _loaded_session_id = session_id
             _stat("refresh_loads", conn=db)
         return result
@@ -3126,7 +3126,7 @@ def _refresh_load(session_id: str = "") -> str:
             if clear_pending:
                 REFRESH_PENDING.unlink(missing_ok=True)
             return f"Refresh file for session {sid[:8]}… not found."
-        content = f.read_text()
+        content = f.read_text(encoding="utf-8")
         if clear_pending:
             REFRESH_PENDING.unlink(missing_ok=True)
         return PREAMBLE + content
@@ -3135,7 +3135,7 @@ def _refresh_load(session_id: str = "") -> str:
         return _load_file(session_id, clear_pending=False)
 
     if REFRESH_PENDING.exists():
-        sid = REFRESH_PENDING.read_text().strip()
+        sid = REFRESH_PENDING.read_text(encoding="utf-8").strip()
         return _load_file(sid, clear_pending=True)
 
     # No pending — list available chain + legacy refresh files
@@ -3155,7 +3155,7 @@ def _refresh_load(session_id: str = "") -> str:
         mtime = datetime.datetime.fromtimestamp(
             f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         try:
-            first_line = f.read_text().splitlines()[0]
+            first_line = f.read_text(encoding="utf-8").splitlines()[0]
         except Exception:
             first_line = ""
         lines.append(f"{i}. [{mtime}] [{label}] {sid[:8]}…  {first_line}")
@@ -3280,7 +3280,7 @@ def _session_start_hook() -> None:
         return
 
     # Peek at pending before _refresh_load clears it — needed for chain handoff
-    loaded_sid = REFRESH_PENDING.read_text().strip()
+    loaded_sid = REFRESH_PENDING.read_text(encoding="utf-8").strip()
 
     # An explicit `clexo load` / load() drops this marker so this restore
     # bypasses the same-directory guard below. Consume it once: a later
@@ -3288,7 +3288,7 @@ def _session_start_hook() -> None:
     explicit_sid = ""
     if REFRESH_EXPLICIT.exists():
         try:
-            explicit_sid = REFRESH_EXPLICIT.read_text().strip()
+            explicit_sid = REFRESH_EXPLICIT.read_text(encoding="utf-8").strip()
         except Exception:
             explicit_sid = ""
         REFRESH_EXPLICIT.unlink(missing_ok=True)
@@ -3334,7 +3334,7 @@ def _session_start_hook() -> None:
                 # session is being continued in a different directory.
                 cross_dir_note = (saved_disp, here_disp)
                 if _debug_enabled():
-                    with open(CLEXO_DIR / "hook.log", "a") as _lf:
+                    with open(CLEXO_DIR / "hook.log", "a", encoding="utf-8") as _lf:
                         _lf.write(
                             f"\n--- {datetime.datetime.now().isoformat()} ---\n"
                             f"MODE: cwd-guard bypass (explicit load) "
@@ -3354,7 +3354,7 @@ def _session_start_hook() -> None:
                     "restore it here."
                 )
                 if _debug_enabled():
-                    with open(CLEXO_DIR / "hook.log", "a") as _lf:
+                    with open(CLEXO_DIR / "hook.log", "a", encoding="utf-8") as _lf:
                         _lf.write(
                             f"\n--- {datetime.datetime.now().isoformat()} ---\n"
                             f"MODE: cwd-guard skip "
@@ -3371,7 +3371,7 @@ def _session_start_hook() -> None:
 
     # Write handoff file so save() in this process knows which chain to extend
     if loaded_sid:
-        _CHAIN_LOADED.write_text(loaded_sid)
+        _CHAIN_LOADED.write_text(loaded_sid, encoding="utf-8")
 
     # Stamp the new session with the per-turn prefix delta for this load.
     # The "delta" is the size of the API prefix that the source session
@@ -3526,7 +3526,7 @@ def _session_start_hook() -> None:
     # hook.log is debug-only — enable by setting "debug": true in ~/.clexo/config.json
     if _debug_enabled():
         log = CLEXO_DIR / "hook.log"
-        with open(log, "a") as _lf:
+        with open(log, "a", encoding="utf-8") as _lf:
             _lf.write(
                 f"\n--- {datetime.datetime.now().isoformat()} ---\n"
                 f"MODE: json hookSpecificOutput\n"
@@ -3567,7 +3567,7 @@ def _install_hooks(settings_path: Path | None = None) -> str:
     raw = ""
     if settings_path.exists():
         try:
-            raw = settings_path.read_text()
+            raw = settings_path.read_text(encoding="utf-8")
             settings = json.loads(raw) if raw.strip() else {}
         except json.JSONDecodeError as e:
             return f"Error: {settings_path} is not valid JSON ({e}). Aborted."
@@ -3643,12 +3643,12 @@ def _install_hooks(settings_path: Path | None = None) -> str:
     if settings_path.exists():
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = settings_path.with_suffix(f".json.bak.{ts}")
-        backup.write_text(raw)
+        backup.write_text(raw, encoding="utf-8")
         out_lines.append(f"Backed up: {backup}")
     else:
         settings_dir.mkdir(parents=True, exist_ok=True)
 
-    settings_path.write_text(new_content)
+    settings_path.write_text(new_content, encoding="utf-8")
     out_lines.extend(change_lines)
     out_lines.append(f"Wrote:     {settings_path}")
     return "\n".join(out_lines)
@@ -4176,9 +4176,27 @@ def _cmd_install() -> int:
     return rc
 
 
+def _force_utf8_io():
+    """Windows defaults stdout/stderr to the console codepage (cp1252), so the
+    box-drawing, em-dash, ellipsis and middot chars clexo prints raise
+    UnicodeEncodeError ('charmap' codec can't encode). Force UTF-8 on the
+    standard streams. No-op where already UTF-8 or where the stream can't be
+    reconfigured (e.g. a pytest capture object). errors='replace' keeps a
+    legacy console that can't render a glyph from crashing."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv=None):
     """Console entry point. Maps friendly subcommands onto the internal flag
     dispatch, so `clexo save` etc. work without the old bash wrapper."""
+    _force_utf8_io()
     args = list(sys.argv[1:] if argv is None else argv)
     cmd = args[0] if args else ""
 
