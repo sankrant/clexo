@@ -1193,3 +1193,55 @@ def test_no_bare_pathlib_text_io_in_cli():
             continue
         offenders.append(src.count("\n", 0, m.start()) + 1)
     assert not offenders, f"pathlib text I/O without encoding= at lines {offenders}"
+
+
+# ── Windows console hand-off (interactive resume/load) ──────────────────────────
+
+def test_run_foreground_windows_waits_instead_of_execvp(monkeypatch):
+    """On Windows os.execvp is a non-blocking overlay: it spawns the child and
+    immediately exits us, so the launching shell's prompt returns and races the
+    child for the same console — keystrokes split between the two, no echo. On
+    Windows _run_foreground must instead BLOCK on the child (subprocess.run) and
+    exit with its status, keeping exactly one console reader at a time."""
+    monkeypatch.setattr(server.os, "name", "nt")
+
+    calls = {}
+    def fake_run(cmd, *a, **k):
+        calls["cmd"] = list(cmd)
+        class Result:
+            returncode = 7
+        return Result()
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+
+    def forbidden_execvp(*a, **k):
+        raise AssertionError("os.execvp is a non-blocking overlay on Windows; "
+                             "_run_foreground must not use it there")
+    monkeypatch.setattr(server.os, "execvp", forbidden_execvp)
+
+    with pytest.raises(SystemExit) as exc:
+        server._run_foreground(["claude", "--resume", "abc"])
+
+    assert exc.value.code == 7                        # propagates the child's exit code
+    assert calls["cmd"][-2:] == ["--resume", "abc"]   # blocked on the right command
+
+
+def test_run_foreground_posix_replaces_process_via_execvp(monkeypatch):
+    """On POSIX exec replaces the process image (same PID the shell waits on), so
+    there is no concurrent shell/child race. _run_foreground must delegate to
+    os.execvp there and never spawn a separate, orphaned subprocess."""
+    monkeypatch.setattr(server.os, "name", "posix")
+
+    seen = {}
+    def fake_execvp(file, argv):
+        seen["file"] = file
+        seen["argv"] = list(argv)
+    monkeypatch.setattr(server.os, "execvp", fake_execvp)
+
+    def forbidden_run(*a, **k):
+        raise AssertionError("subprocess.run must not run on POSIX; use os.execvp")
+    monkeypatch.setattr(server.subprocess, "run", forbidden_run)
+
+    server._run_foreground(["claude", "--resume", "abc"])
+
+    assert seen["file"] == "claude"
+    assert seen["argv"] == ["claude", "--resume", "abc"]
