@@ -712,6 +712,25 @@ def _ensure_snapshot(session_id: str) -> str | None:
     return result if result.startswith("No session JSONL") else None
 
 
+def _run_foreground(argv: list[str]) -> None:
+    """Hand the terminal off to an interactive CLI (claude/codex/grok) so it
+    becomes the console's sole foreground process.
+
+    POSIX: os.exec* replaces this process image in place, so the launching shell
+    keeps waiting on our single PID until the child exits — no console contention.
+
+    Windows: there is no process-image replacement. os.exec* spawns the child and
+    then immediately exits us, so the shell's prompt returns and races the still
+    running child for the same console — keystrokes are split between the two and
+    typed input isn't echoed. Block on the child instead (single console reader at
+    a time) and exit with its status once it's done."""
+    if os.name == "nt":
+        exe = shutil.which(argv[0]) or argv[0]
+        completed = subprocess.run([exe, *argv[1:]])
+        sys.exit(completed.returncode)
+    os.execvp(argv[0], argv)
+
+
 def _exec_load(session_id: str, source: str = "claude", allow_print: bool = True) -> None:
     """Load a session's compacted snapshot into a fresh CLI session (the
     SessionStart hook injects it). Builds the snapshot first if missing — works
@@ -727,7 +746,7 @@ def _exec_load(session_id: str, source: str = "claude", allow_print: bool = True
     REFRESH_EXPLICIT.write_text(session_id, encoding="utf-8")
     binary = _resume_binary(source or "claude")
     if sys.stdout.isatty():
-        os.execvp(binary, [binary])
+        _run_foreground([binary])
     elif allow_print:
         print(f"Snapshot ready for {session_id}. Run: {binary}")
 
@@ -740,7 +759,7 @@ def _exec_resume(session_id: str, source: str = "claude", allow_print: bool = Tr
     if _live_session_jsonl(session_id, source):
         argv = _resume_argv(source, session_id)
         if sys.stdout.isatty():
-            os.execvp(argv[0], argv)
+            _run_foreground(argv)
         elif allow_print:
             print(_resume_cmd(source, session_id))
         return
