@@ -170,8 +170,7 @@ def _claude_source_prefix(jsonl_path) -> tuple[int, int]:
     usage blocks (e.g. a Codex JSONL or an empty session)."""
     if not jsonl_path or not jsonl_path.exists():
         return 0, 0
-    last_input = 0
-    last_cache = 0
+    last = (0, 0)
     try:
         with open(jsonl_path, "rb") as f:
             for raw in f:
@@ -182,18 +181,28 @@ def _claude_source_prefix(jsonl_path) -> tuple[int, int]:
                     obj = json.loads(raw.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
                     continue
-                if obj.get("type") != "assistant":
-                    continue
-                u = (obj.get("message") or {}).get("usage") or {}
-                ipt   = int(u.get("input_tokens")               or 0)
-                cread = int(u.get("cache_read_input_tokens")    or 0)
-                cwrt  = int(u.get("cache_creation_input_tokens") or 0)
-                if (ipt + cread + cwrt) > 0:
-                    last_input = ipt
-                    last_cache = cread + cwrt
+                last = _assistant_usage(obj) or last
     except Exception:
         return 0, 0
-    return last_input, last_cache
+    return last
+
+
+def _assistant_usage(obj) -> tuple[int, int] | None:
+    """(input_tokens, cache_tokens) from one assistant record's `usage`, or None
+    if the record is not an assistant turn or carries no usage."""
+    if not isinstance(obj, dict) or obj.get("type") != "assistant":
+        return None
+    msg = obj.get("message")
+    u = (msg.get("usage") if isinstance(msg, dict) else None) or {}
+    try:
+        ipt   = int(u.get("input_tokens")               or 0)
+        cread = int(u.get("cache_read_input_tokens")    or 0)
+        cwrt  = int(u.get("cache_creation_input_tokens") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if ipt + cread + cwrt <= 0:
+        return None
+    return ipt, cread + cwrt
 
 
 # ── incremental line reader ───────────────────────────────────────────────────
@@ -563,6 +572,8 @@ def _sync_grok(conn: sqlite3.Connection) -> int:
 def _backfill_claude_titles(conn) -> int:
     """One-time pass: extract ai-title / custom-title / last-prompt for sessions
     that were indexed before we started capturing these fields."""
+    if conn.execute("SELECT 1 FROM stats WHERE key='migration_backfill_titles'").fetchone():
+        return 0
     untitled = conn.execute("""
         SELECT session_id FROM sessions
         WHERE source='claude' AND (thread_name IS NULL OR thread_name='')
@@ -603,6 +614,7 @@ def _backfill_claude_titles(conn) -> int:
             )
             updated += 1
 
+    conn.execute("INSERT OR IGNORE INTO stats(key, value) VALUES('migration_backfill_titles', 1)")
     conn.commit()
     return updated
 
@@ -2522,6 +2534,7 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
 
     msgs = []
     full_chars = 0
+    last_usage = (0, 0)
     with open(jsonl, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -2562,6 +2575,7 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
                                 msgs.append(('user', text, ts))
                         continue
                     if otype not in ('user', 'assistant'): continue
+                    last_usage = _assistant_usage(obj) or last_usage
                     msg      = obj.get('message', {})
                     role     = msg.get('role', otype)
                     raw      = msg.get('content', '')
@@ -2657,7 +2671,7 @@ def refresh_save(session_id: str = "", db: sqlite3.Connection | None = None) -> 
     # — that's the API prefix this snapshot eliminates. For Codex (no usage
     # data) fall back to extracted-text bytes.
     if source == 'claude':
-        src_input, src_cache = _claude_source_prefix(jsonl)
+        src_input, src_cache = last_usage
         src_tok = src_input + src_cache
     else:
         src_tok = full_chars // 4
